@@ -51,3 +51,6 @@ $ expense-tracker summary
 $ expense-tracker summary --month 8
 # Total expenses for August: $20
 ```
+
+## How to maintain
+The cutomized formats of output e.g. money amount, month, default year etc. could be found in ```cli.py``` with key word **format** 
