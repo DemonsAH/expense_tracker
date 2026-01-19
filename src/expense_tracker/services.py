@@ -1,5 +1,5 @@
 from datetime import date
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from expense_tracker.models import Expense
 from expense_tracker.storage import ExpenseStorage
@@ -85,3 +85,27 @@ class ExpenseService:
             for e in self.storage.get_all_expenses()
             if e.date.year == year and e.date.month == month
         )
+    
+    def get_categories(self) -> Set[str]:
+        """
+        Return all existing non-empty categories (case-sensitive as stored).
+        """
+        categories: Set[str] = set()
+        for e in self.storage.get_all_expenses():
+            if e.category is not None and e.category.strip():
+                categories.add(e.category.strip())
+        return categories
+
+    def list_expenses_by_category(self, category: str) -> List["Expense"]:
+        """
+        Filter expenses by exact category match.
+        """
+        cat = category.strip()
+        if not cat:
+            raise ValueError("Category cannot be empty")
+
+        return [
+            e for e in self.storage.get_all_expenses()
+            if (e.category is not None and e.category.strip() == cat)
+        ]
+

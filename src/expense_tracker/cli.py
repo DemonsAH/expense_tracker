@@ -88,6 +88,28 @@ def cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_filter(args: argparse.Namespace) -> int:
+    service = ExpenseService()
+
+    if args.category is None or not args.category.strip():
+        print("# Error: --category cannot be empty")
+        return 1
+    category = args.category.strip()
+
+    existing = service.get_categories()
+    if category not in existing:
+        print(f"# Error: Category '{category}' not found.")
+        if existing:
+            print(f"# Existing categories: {', '.join(sorted(existing))}")
+        return 1
+    expenses = service.list_expenses_by_category(category)
+    print("# ID  Date        Description  Amount  Category")
+    for e in expenses:
+        print(f"# {e.id:<3} {e.date.isoformat():<10}  {e.description:<11}  {_fmt_money(e.amount):<7} {e.category or ''}")
+
+    return 0
+    
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="expense-tracker",
@@ -123,6 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sum = subparsers.add_parser("summary", help="Show expense summary")
     p_sum.add_argument("--month", required=False, type=int, default=None, help="Month (1-12) of current year")
     p_sum.set_defaults(func=cmd_summary)
+
+    #filter
+    p_fil = subparsers.add_parser("filter", help="Filter expenses by field category")
+    p_fil.add_argument("--category", required=False, type=str, default=None, help="One of the stored categories")
+    p_fil.set_defaults(func=cmd_filter)
 
     return parser
 
