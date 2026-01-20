@@ -1,5 +1,7 @@
 from datetime import date
 from typing import List, Optional, Set
+import csv
+from pathlib import Path
 
 from expense_tracker.models import Expense
 from expense_tracker.storage import ExpenseStorage
@@ -108,4 +110,35 @@ class ExpenseService:
             e for e in self.storage.get_all_expenses()
             if (e.category is not None and e.category.strip() == cat)
         ]
+    
+    def export_to_csv(self, file_path: str) -> Path:
+        """
+        Export all expenses to a CSV file.
+        Returns the Path of the written file.
+        """
+        path = Path(file_path)
+
+        expenses = self.storage.get_all_expenses()
+
+        # 确保父目录存在
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+
+            # header
+            writer.writerow(["id", "date", "description", "amount", "category"])
+
+            for e in expenses:
+                writer.writerow([
+                    e.id,
+                    e.date.isoformat(),
+                    e.description,
+                    e.amount,
+                    e.category or "",   # Optional[str] → 空字符串
+                ])
+
+        return path
+
 

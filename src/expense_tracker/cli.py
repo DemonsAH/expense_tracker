@@ -108,7 +108,19 @@ def cmd_filter(args: argparse.Namespace) -> int:
         print(f"# {e.id:<3} {e.date.isoformat():<10}  {e.description:<11}  {_fmt_money(e.amount):<7} {e.category or ''}")
 
     return 0
-    
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    service = ExpenseService()
+
+    if not args.file or not args.file.strip():
+        print("# Error: --file must be provided")
+        return 1
+
+    path = service.export_to_csv(args.file)
+    print(f"# Expenses exported successfully to {path}")
+    return 0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -148,8 +160,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     #filter
     p_fil = subparsers.add_parser("filter", help="Filter expenses by field category")
-    p_fil.add_argument("--category", required=False, type=str, default=None, help="One of the stored categories")
+    p_fil.add_argument("--category", required=True, type=str, default=None, help="One of the stored categories")
     p_fil.set_defaults(func=cmd_filter)
+
+    # export
+    p_export = subparsers.add_parser("export", help="Export expenses to a CSV file")
+    p_export.add_argument("--file", required=True, help="Output CSV file path (e.g. expenses.csv)",)
+    p_export.set_defaults(func=cmd_export)
 
     return parser
 
