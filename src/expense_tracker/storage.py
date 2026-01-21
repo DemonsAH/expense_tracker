@@ -23,7 +23,7 @@ class ExpenseStorage:
             self.file_path.parent.mkdir(parents=True)
 
         if not self.file_path.exists():
-            self._write_data({"last_id": 0, "expenses": []})
+            self._write_data({"last_id": 0, "expenses": [], "budgets": {}})
 
     def _read_data(self) -> dict:
         with open(self.file_path, "r", encoding="utf-8") as f:
@@ -49,3 +49,12 @@ class ExpenseStorage:
         data["last_id"] += 1
         self._write_data(data)
         return data["last_id"]
+    
+    def get_budgets(self) -> dict:
+        return self._read_data()["budgets"]
+
+    def set_budget(self, key: str, amount: float) -> None:
+        data = self._read_data()
+        data["budgets"][key] = amount
+        self._write_data(data)
+

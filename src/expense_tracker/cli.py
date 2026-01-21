@@ -23,13 +23,14 @@ def _month_name(month: int) -> str:
 
 def cmd_add(args: argparse.Namespace) -> int:
     service = ExpenseService()
-    expense = service.add_expense(
+    expense, warning = service.add_expense(
         description=args.description,
         amount=args.amount,
         category=args.category,
         spent_on=None,  # current date as default date
     )
     print(f"# Expense added successfully (ID: {expense.id})")
+    if warning: print(warning)
     return 0
 
 
@@ -56,12 +57,13 @@ def cmd_update(args: argparse.Namespace) -> int:
     if args.description is None and args.amount is None and args.category is None:
         raise ValueError("Nothing to update. Provide --description and/or --amount and/or --category.")
 
-    service.update_expense(
+    e, warning = service.update_expense(
         expense_id=args.id,
         description=args.description,
         amount=args.amount,
         category=args.category,
     )
+    if warning: print(warning)
     print("# Expense updated successfully")
     return 0
 
@@ -119,6 +121,20 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     path = service.export_to_csv(args.file)
     print(f"# Expenses exported successfully to {path}")
+    return 0
+
+def cmd_budget_set(args: argparse.Namespace) -> int:
+    service = ExpenseService()
+
+    if not args.amount:
+        print("# Error: --amount should not be none")
+        return 1
+    
+    if not args.year:
+        year = date.today().year
+    year = args.year
+    service.set_monthly_budget(amount=args.amount, month=args.month, year=year)
+    print(f"ExpenseTracker: budget of {_month_name(args.month)}, {year} is set to {_fmt_money(args.amount)}")
     return 0
 
 
