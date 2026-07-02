@@ -376,17 +376,13 @@ def trigger_ingestion(paths: AppPaths, image_path: str | Path) -> str:
     if not image.exists():
         raise FileNotFoundError(image)
 
-    store = load_receipt_store(paths.store_path)
-    owners_config = load_owners_config(paths.owners_path)
-
     result = ingest_receipt_with_retries(
         image_path=image,
-        store=store,
-        owners_config=owners_config,
-        max_retries=3,
+        owners_path=paths.owners_path,
+        store_path=paths.store_path,
+        max_attempts=3,
     )
-    save_receipt_store(store, paths.store_path)
-    return result.receipt_id
+    return result.receipt_record.id
 
 
 def reopen_failed_receipt(paths: AppPaths, failed_index: int) -> str:

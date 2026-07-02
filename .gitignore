@@ -1,3 +1,11 @@
 /.conda
 /.env
 /.owners.local.json
+__pycache__/
+*.pyc
+*.egg-info/
+data/tmp*/
+build/
+dist/
+.vscode/
+.trae/
