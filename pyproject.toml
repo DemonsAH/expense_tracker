@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "expense-tracker"
+version = "0.2.0"
+description = "A command-line expense tracker with OCR receipt recognition"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "DemonsAH", email = "your@email.com"}
+]
+
+dependencies = [
+    "pillow>=9.0.0",
+    "opencv-python>=4.5.0",
+    "numpy>=1.21.0",
+    "pydantic>=2.0",
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "langsmith>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+automation = [
+    "apscheduler>=3.10.0",
+]
+
+[project.scripts]
+expense-tracker = "expense_tracker.cli:main"
+expense-tracker-gui = "expense_tracker.gui.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

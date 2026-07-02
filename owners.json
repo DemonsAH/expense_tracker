@@ -1,0 +1,40 @@
+{
+  "owners": [
+    {
+      "id": "chen",
+      "name": "Qihong Chen",
+      "marker": "Q",
+      "is_me": true
+    },
+    {
+      "id": "fang",
+      "name": "Yulin Fang",
+      "marker": "F",
+      "is_me": false
+    },
+    {
+      "id": "zhang",
+      "name": "Huiyin Zhang",
+      "marker": "Z",
+      "is_me": false
+    },
+    {
+      "id": "cui",
+      "name": "Wei Cui",
+      "marker": "C",
+      "is_me": false
+    },
+    {
+      "id": "shen",
+      "name": "Honghui Shen",
+      "marker": "S",
+      "is_me": false
+    },
+    {
+      "id": "louis",
+      "name": "Haochen Lu",
+      "marker": "L",
+      "is_me": false
+    }
+  ]
+}
