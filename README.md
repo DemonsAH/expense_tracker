@@ -27,18 +27,9 @@ pip install -e .
 DEEPSEEK_API_KEY=你的DeepSeek官方API密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 EXPENSE_TRACKER_LLM_MODEL=deepseek-v4-flash
-
-# SiliconFlow（旧版外部模型通道，当前链路不再使用）
-SILICONFLOW_API_KEY=你的API密钥
-SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
-
-LANGSMITH_API_KEY=你的LangSmith密钥
-LANGSMITH_PROJECT=expense-tracker
-EXPENSE_TRACKER_ENABLE_LANGSMITH=true
 ```
 
 - `DEEPSEEK_API_KEY` 是 **DeepSeek 官方 API** 密钥（https://platform.deepseek.com 获取）。仅在 GUI 勾选「Use DeepSeek V4-Flash (external)」时使用，将本地 OCR 的文本输出交给 DeepSeek V4-Flash 转成结构化 JSON，思考功能已关闭。
-- `EXPENSE_TRACKER_ENABLE_LANGSMITH=true` 开启 LangSmith 追踪；不需要可设为 `false`
 - 默认 OCR 链路（本地 GLM OCR，`ocr_service\llama\` 部署，见 `GLM-OCR本地部署指南.md`）**不需要任何 API key**
 
 ### GLM-OCR 模型文件下载
@@ -425,9 +416,12 @@ expense-tracker run-ingest-job incoming_receipts --recursive
 src/expense_tracker/
 ├── cli.py              # CLI 命令行入口
 ├── config.py           # 系统配置管理
+├── preprocess.py       # 图片预处理（裁剪黑背景 + 透视矫正）
 ├── ocr_client.py       # 多模态模型调用客户端
 ├── ocr_parser.py       # OCR 文本解析器（归属人标记检测等）
 ├── llm_client.py       # LLM 客户端抽象
+├── llm_parser.py       # LLM 解析：OCR 文本 → 结构化 JSON
+├── llm_grounding_parser.py  # DeepSeek API 解析：OCR 文本 → 结构化 JSON（独立通道）
 ├── tracing.py          # LangSmith 追踪
 ├── pipelines/          # 处理管线
 │   ├── receipt_ingestion.py    # 主入库管线
@@ -450,8 +444,6 @@ src/expense_tracker/
 ├── automation/         # 自动化任务
 │   ├── ingest_jobs.py  # 定时入库任务
 │   └── report_jobs.py  # 定时报表任务
-├── prompts/            # Prompt 模板
-│   └── receipt_prompt.py  # 小票识别 Prompt 构建
 └── gui/                # 图形界面
     ├── app.py          # Tkinter 主界面
     └── services.py     # GUI 业务服务层
@@ -472,3 +464,14 @@ tests/                  # 231 个单元测试
 ├── test_receipt_pipeline.py
 └── conftest.py
 ```
+
+---
+
+## 未来更新计划
+
+1. **单个 Item 的 Split 方案**：支持多种拆分方式（按份数均分 / 按比例分配等），便于多人分摊同一商品。
+2. **多数量 Item 的拆分合并优化**：现阶段仅支持拆分，后续支持同商品多行（多数量）的合并统计与拆分。
+3. **dm / go asia 小票完美适配**：现阶段存在识别硬伤——dm 商品税种、go asia 折扣会导致识别出错，需要人工复核；后续针对特殊票面布局优化识别。
+4. **折扣小票分给多人时的价格适配**：支持折扣金额在多人分摊场景下的价格计算与归属。
+5. **年度/季度汇总报表**：在月度报表基础上扩展季度、年度汇总与同比分析。
+6. **测试完善去重功能**：完善重复小票检测（sha256 完全去重）的测试覆盖。
