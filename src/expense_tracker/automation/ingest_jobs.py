@@ -11,6 +11,7 @@ from expense_tracker.storage import (
     has_processed_image,
     load_receipt_store,
     move_source_file,
+    save_receipt_store,
 )
 
 
@@ -84,7 +85,6 @@ def run_ingest_directory_job(
     directory: str | Path,
     *,
     owners_path: str | Path = "owners.json",
-    model: str = "Qwen/Qwen3.6-27B",
     max_attempts: int = 3,
     artifact_output_dir: str | Path | None = None,
     failure_output_dir: str | Path = "rejected_receipts",
@@ -93,6 +93,9 @@ def run_ingest_directory_job(
     archive_failures: bool = True,
     duplicate_policy: str = "skip-success",
     recursive: bool = False,
+    use_llm_parser: bool = False,
+    use_preprocess: bool = False,
+    keep_failures: bool = False,
 ) -> IngestJobResult:
     duplicate_policy = _validate_duplicate_policy(duplicate_policy)
     root = Path(directory)
@@ -126,10 +129,9 @@ def run_ingest_directory_job(
             continue
 
         try:
-            ingest_receipt_with_retries(
+            ingestion_result = ingest_receipt_with_retries(
                 image_path=image_path,
                 owners_path=owners_path,
-                model=model,
                 max_attempts=max_attempts,
                 save_artifacts=True,
                 artifact_output_dir=artifact_output_dir,
@@ -137,20 +139,32 @@ def run_ingest_directory_job(
                 store_path=store_path,
                 archive_failures=archive_failures,
                 failure_output_dir=failure_output_dir,
+                use_llm_parser=use_llm_parser,
+                use_preprocess=use_preprocess,
             )
             result.success_count += 1
             result.success_files.append(image_path.name)
+            # 成功：按分配的 receipt id 重命名图片并移入"已处理"目录，
+            # 同时更新 store 里的 image_path 指向新位置。
             moved_path = move_source_file(
                 image_path,
                 source_root=root,
                 destination_root=processed_output_dir,
+                dest_stem=ingestion_result.receipt_record.id,
             )
             result.moved_success_files.append(str(moved_path))
             store = load_receipt_store(store_path)
+            for receipt in store.receipts:
+                if receipt.id == ingestion_result.receipt_record.id:
+                    receipt.image_path = str(moved_path)
+                    break
+            save_receipt_store(store, store_path)
         except Exception:
             result.failure_count += 1
             result.failed_files.append(image_path.name)
-            if image_path.exists():
+            # 三目录工作流（未处理→已处理→已校对）：失败文件留在源目录，
+            # 便于人工查看原因后重试；否则保持原有行为移入失败目录。
+            if not keep_failures and image_path.exists():
                 moved_path = move_source_file(
                     image_path,
                     source_root=root,

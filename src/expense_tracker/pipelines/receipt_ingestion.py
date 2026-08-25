@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic import ValidationError as PydanticValidationError
 
+from expense_tracker.ocr_client import run_ocr, strip_grounding
+from expense_tracker.ocr_parser import parse_ocr_to_extracted_receipt
 from expense_tracker.pipelines.receipt_validation import (
     ReceiptValidationResult,
     validate_extracted_receipt_business_rules,
 )
 from expense_tracker.pipelines.receipt_postprocess import ProcessedReceiptItems, process_extracted_receipt_items
 from expense_tracker.pipelines.retry_policy import is_retryable_ingestion_error
-from expense_tracker.receipt_step1 import run_receipt_step1
 from expense_tracker.schemas import extracted_to_receipt_record
 from expense_tracker.schemas.domain import ReceiptRecord
+from expense_tracker.schemas.enums import OcrStatus
 from expense_tracker.schemas.extraction import ExtractedReceipt
 from expense_tracker.schemas.owners import OwnersConfig, load_owners_config
 from expense_tracker.storage.artifacts import (
@@ -33,7 +37,12 @@ from expense_tracker.storage.json_store import (
     next_receipt_id,
     save_receipt_store,
 )
-from expense_tracker.tracing import receipt_traceable
+
+# GLM-OCR 提示词必须是 "OCR"（见 GLM-OCR本地部署指南.md §8.1，写别的会退化）
+OCR_PROMPT = "OCR"
+
+_OCR_MODEL = "local-glm-ocr"
+_LLM_MODEL = "deepseek-v4-flash"
 
 
 @dataclass
@@ -59,6 +68,7 @@ class ReceiptIngestionResult:
     failure_path: Path | None = None
     attempt_count: int = 1
     previous_failures: list[ReceiptAttemptFailure] = field(default_factory=list)
+    preprocess_info: dict | None = None
 
 
 class ReceiptAttemptError(ValueError):
@@ -82,32 +92,95 @@ def parse_extracted_receipt(content: str) -> ExtractedReceipt:
         raise ValueError(f"Model output does not match ExtractedReceipt schema: {exc}") from exc
 
 
+def _run_ocr(image: Path, *, use_preprocess: bool, prompt: str) -> tuple[str, dict | None]:
+    """Run OCR on the image, optionally after receipt preprocessing.
+
+    When preprocessing is enabled, the image is cropped from the (black)
+    background and perspective-corrected per 图片预处理指南.md before being
+    sent to the OCR model. The preprocessed image is written to a temp file,
+    and the original file is never modified.
+    """
+    if not use_preprocess:
+        return run_ocr(image, prompt=prompt, keep_grounding=True), None
+
+    # 延迟导入：开关关闭时避免 cv2 的启动开销
+    import cv2
+    from expense_tracker.preprocess import load_image, preprocess
+
+    result = preprocess(load_image(image))
+    print(
+        "[preprocess] method={} found_receipt={} info={}".format(
+            result.method, result.found_receipt, result.info
+        )
+    )
+
+    fd, tmp_path = tempfile.mkstemp(prefix=f"{image.stem}_preprocessed_", suffix=".png")
+    os.close(fd)
+    try:
+        if not cv2.imwrite(tmp_path, result.image):
+            raise RuntimeError("Failed to write preprocessed image to temp file")
+        text = run_ocr(Path(tmp_path), prompt=prompt, keep_grounding=True)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    return text, {
+        "method": result.method,
+        "found_receipt": result.found_receipt,
+        "info": result.info,
+    }
+
+
 def _ingest_receipt_attempt(
     image: Path,
     *,
     owners_path: str | Path,
-    model: str,
     save_artifacts: bool,
     artifact_output_dir: str | Path | None,
     persist_store: bool,
     store_path: str | Path,
+    use_llm_parser: bool = False,
+    use_preprocess: bool = False,
 ) -> ReceiptIngestionResult:
     owners = load_owners_config(owners_path)
     image_hash = compute_file_sha256(image)
-    content = run_receipt_step1(
-        image_path=image,
-        owners_path=owners_path,
-        model=model,
+
+    raw_ocr_text, preprocess_info = _run_ocr(
+        image,
+        use_preprocess=use_preprocess,
+        prompt=OCR_PROMPT,
     )
 
     try:
-        extracted = parse_extracted_receipt(content)
+        if use_llm_parser:
+            from expense_tracker.llm_grounding_parser import parse_grounding_with_deepseek
+
+            extracted = parse_grounding_with_deepseek(
+                raw_ocr_text,
+                owners_path=owners_path,
+            )
+            model = _LLM_MODEL
+        else:
+            extracted = parse_ocr_to_extracted_receipt(
+                strip_grounding(raw_ocr_text),
+                owners_path=owners_path,
+            )
+            model = _OCR_MODEL
         validation = validate_extracted_receipt_business_rules(
             extracted,
             owners=owners,
         )
+        # 任何业务校验问题（总金额不匹配、单项价格不匹配等）都降级为
+        # "needs review"：receipt 仍会入库，用户在 GUI 里逐项人工核对修改，
+        # 而不是直接拒绝归档。称重/交错排版小票的单价×数量往往对不上，
+        # 强行拒绝会导致整张小票丢失。
+        review_notes = None
         if not validation.is_valid:
-            raise ValueError("Business validation failed: " + ", ".join(validation.issues))
+            review_notes = (
+                "自动识别存在校验问题，待人工核对。"
+                + "校验问题: " + ", ".join(validation.issues)
+            )
         processed_items = process_extracted_receipt_items(extracted)
         if persist_store:
             store = load_receipt_store(store_path)
@@ -125,13 +198,23 @@ def _ingest_receipt_attempt(
             image_path=str(image),
             image_hash=image_hash,
             item_id_factory=item_id_factory,
-            raw_text=content,
+            raw_text=raw_ocr_text,
         )
+        if review_notes is not None:
+            receipt_record.ocr_status = OcrStatus.NEEDS_REVIEW
+            receipt_record.ocr_failure_reason = "business_validation_issues"
+            receipt_record.review_notes = review_notes
+            # Keep the OCR-extracted total so the reviewer can see the gap
+            # between the receipt total and the parsed item sum.
+            receipt_record.total_amount = extracted.total_amount
+        else:
+            # 校验通过（含总价核对一致）：标记自动识别成功，等待人工确认。
+            receipt_record.ocr_status = OcrStatus.SUCCESS
         if persist_store and store is not None:
             append_receipt_record(store, receipt_record)
             save_receipt_store(store, store_path)
     except Exception as exc:
-        raise ReceiptAttemptError(str(exc), content=content) from exc
+        raise ReceiptAttemptError(str(exc), content=raw_ocr_text) from exc
 
     content_path = None
     receipt_path = None
@@ -139,7 +222,7 @@ def _ingest_receipt_attempt(
         content_path, receipt_path = save_extraction_artifacts(
             image_path=image,
             model=model,
-            content=content,
+            content=raw_ocr_text,
             extracted=extracted,
             output_dir=artifact_output_dir,
         )
@@ -147,7 +230,7 @@ def _ingest_receipt_attempt(
     return ReceiptIngestionResult(
         image_path=image,
         model=model,
-        content=content,
+        content=raw_ocr_text,
         extracted=extracted,
         processed_items=processed_items,
         receipt_record=receipt_record,
@@ -155,6 +238,7 @@ def _ingest_receipt_attempt(
         validation=validation,
         content_path=content_path,
         receipt_path=receipt_path,
+        preprocess_info=preprocess_info,
     )
 
 
@@ -168,22 +252,18 @@ def _make_item_id_factory(receipt_key: str):
     return next_item_id
 
 
-@receipt_traceable(
-    name="receipt_ingestion_once",
-    run_type="chain",
-    metadata={"pipeline_stage": "step1_parse_validate_save"},
-)
 def ingest_receipt_once(
     image_path: str | Path,
     *,
     owners_path: str | Path = "owners.json",
-    model: str = "Qwen/Qwen3.6-27B",
     save_artifacts: bool = True,
     artifact_output_dir: str | Path | None = None,
     persist_store: bool = True,
     store_path: str | Path = "data/receipts.json",
     archive_failures: bool = True,
     failure_output_dir: str | Path = "rejected_receipts",
+    use_llm_parser: bool = False,
+    use_preprocess: bool = False,
 ) -> ReceiptIngestionResult:
     """Run one end-to-end extraction attempt: call model, validate, and save."""
     image = Path(image_path)
@@ -191,11 +271,12 @@ def ingest_receipt_once(
         return _ingest_receipt_attempt(
             image=image,
             owners_path=owners_path,
-            model=model,
             save_artifacts=save_artifacts,
             artifact_output_dir=artifact_output_dir,
             persist_store=persist_store,
             store_path=store_path,
+            use_llm_parser=use_llm_parser,
+            use_preprocess=use_preprocess,
         )
     except ReceiptAttemptError as exc:
         archived_image_path = None
@@ -203,7 +284,7 @@ def ingest_receipt_once(
         if archive_failures:
             archived_image_path, _, failure_path = save_failure_artifacts(
                 image_path=image,
-                model=model,
+                model=_LLM_MODEL if use_llm_parser else _OCR_MODEL,
                 failure_reason=str(exc),
                 content=exc.content,
                 output_dir=failure_output_dir,
@@ -230,16 +311,10 @@ def ingest_receipt_once(
         ) from exc
 
 
-@receipt_traceable(
-    name="receipt_ingestion_with_retries",
-    run_type="chain",
-    metadata={"pipeline_stage": "retry_loop"},
-)
 def ingest_receipt_with_retries(
     image_path: str | Path,
     *,
     owners_path: str | Path = "owners.json",
-    model: str = "Qwen/Qwen3.6-27B",
     max_attempts: int = 3,
     save_artifacts: bool = True,
     artifact_output_dir: str | Path | None = None,
@@ -247,6 +322,8 @@ def ingest_receipt_with_retries(
     store_path: str | Path = "data/receipts.json",
     archive_failures: bool = True,
     failure_output_dir: str | Path = "rejected_receipts",
+    use_llm_parser: bool = False,
+    use_preprocess: bool = False,
 ) -> ReceiptIngestionResult:
     """Retry receipt ingestion up to max_attempts and archive all failed attempts."""
     image = Path(image_path)
@@ -257,11 +334,12 @@ def ingest_receipt_with_retries(
             result = _ingest_receipt_attempt(
                 image=image,
                 owners_path=owners_path,
-                model=model,
                 save_artifacts=save_artifacts,
                 artifact_output_dir=artifact_output_dir,
                 persist_store=persist_store,
                 store_path=store_path,
+                use_llm_parser=use_llm_parser,
+                use_preprocess=use_preprocess,
             )
             result.attempt_count = attempt_number
             result.previous_failures = failures
@@ -287,7 +365,7 @@ def ingest_receipt_with_retries(
             if archive_failures:
                 archived_image_path, _, failure_path = save_retry_failure_artifacts(
                     image_path=image,
-                    model=model,
+                    model=_LLM_MODEL if use_llm_parser else _OCR_MODEL,
                     failures=[
                         {
                             "attempt_number": failure.attempt_number,
@@ -315,11 +393,12 @@ def ingest_receipt_with_retries(
                     )
                     save_receipt_store(store, store_path)
 
-            raise ValueError(
+            raise ReceiptAttemptError(
                 str(exc)
                 + (
                     f" | attempts={attempt_number} | archived_image_path={archived_image_path} | failure_path={failure_path}"
                     if archive_failures
                     else f" | attempts={attempt_number}"
-                )
+                ),
+                content=exc.content,
             ) from exc

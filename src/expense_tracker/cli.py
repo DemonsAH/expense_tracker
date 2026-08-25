@@ -10,7 +10,6 @@ from expense_tracker.automation import run_ingest_directory_job, run_previous_mo
 from expense_tracker.pipelines import ingest_receipt_with_retries
 from expense_tracker.reports import update_monthly_report
 from expense_tracker.storage import compute_file_sha256, has_processed_image, load_receipt_store
-from expense_tracker.tracing import flush_traces
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -74,6 +73,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the final receipt_record as JSON.",
     )
+    ingest_parser.add_argument(
+        "--preprocess",
+        action="store_true",
+        help="Enable receipt image preprocessing (black-background crop + perspective correction).",
+    )
 
     ingest_dir_parser = subparsers.add_parser(
         "ingest-dir",
@@ -125,6 +129,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-skip-processed",
         action="store_true",
         help="Do not skip images that are already present in the JSON store.",
+    )
+    ingest_dir_parser.add_argument(
+        "--preprocess",
+        action="store_true",
+        help="Enable receipt image preprocessing (black-background crop + perspective correction).",
     )
 
     report_parser = subparsers.add_parser(
@@ -199,11 +208,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to owners.json.",
     )
     ingest_job_parser.add_argument(
-        "--model",
-        default="Qwen/Qwen3.6-27B",
-        help="SiliconFlow model name.",
-    )
-    ingest_job_parser.add_argument(
         "--max-attempts",
         type=int,
         default=3,
@@ -250,6 +254,21 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Scan the target directory recursively.",
     )
+    ingest_job_parser.add_argument(
+        "--use-llm-parser",
+        action="store_true",
+        help="Use the remote LLM parser for grounding-based extraction.",
+    )
+    ingest_job_parser.add_argument(
+        "--preprocess",
+        action="store_true",
+        help="Enable receipt image preprocessing (black-background crop + perspective correction).",
+    )
+    ingest_job_parser.add_argument(
+        "--keep-failures",
+        action="store_true",
+        help="Leave failed images in the source directory instead of moving them to the failure dir.",
+    )
     return parser
 
 
@@ -265,6 +284,7 @@ def _run_ingest(args: argparse.Namespace) -> int:
         store_path=args.store_path,
         archive_failures=not args.no_archive,
         failure_output_dir=args.failure_dir,
+        use_preprocess=args.preprocess,
     )
 
     print("INGEST_SUCCESS")
@@ -338,6 +358,7 @@ def _run_ingest_dir(args: argparse.Namespace) -> int:
                 store_path=args.store_path,
                 archive_failures=not args.no_archive,
                 failure_output_dir=args.failure_dir,
+                use_preprocess=args.preprocess,
             )
             success_count += 1
             print(
@@ -424,7 +445,6 @@ def _run_ingest_job(args: argparse.Namespace) -> int:
     result = run_ingest_directory_job(
         args.directory,
         owners_path=args.owners,
-        model=args.model,
         max_attempts=args.max_attempts,
         artifact_output_dir=args.artifact_dir,
         failure_output_dir=args.failure_dir,
@@ -433,6 +453,9 @@ def _run_ingest_job(args: argparse.Namespace) -> int:
         archive_failures=not args.no_archive,
         duplicate_policy=duplicate_policy,
         recursive=args.recursive,
+        use_llm_parser=args.use_llm_parser,
+        use_preprocess=args.preprocess,
+        keep_failures=args.keep_failures,
     )
     print("INGEST_JOB_DONE")
     print(f"directory: {result.directory}")
@@ -469,7 +492,7 @@ def main() -> int:
         print(str(exc))
         return 1
     finally:
-        flush_traces()
+        pass
 
 
 if __name__ == "__main__":

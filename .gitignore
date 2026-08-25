@@ -9,3 +9,34 @@ build/
 dist/
 .vscode/
 .trae/
+
+# 虚拟环境
+build_venv/
+.venv/
+venv/
+env/
+
+# 票据输入目录（含未来新增的文件）
+receipt_input/
+
+# 数据与报表目录
+data/
+reports/
+
+# 备份与测试资源
+backup/
+test_receipts/
+tests/
+
+# GLM-OCR 模型文件（大文件，不纳入版本控制）
+ocr_service/llama/models/*.gguf
+
+# llama.cpp 运行时（exe/dll，可从 llama.cpp Releases 重新下载，见 README）
+ocr_service/llama/*.exe
+ocr_service/llama/*.dll
+ocr_service/llama/*.log
+
+# 临时文件与运行时归档
+check4.txt
+check5.txt
+rejected_receipts/

@@ -23,6 +23,12 @@ pip install -e .
 创建或编辑项目根目录下的 `.env` 文件：
 
 ```env
+# DeepSeek 官方 API（可选外部解析引擎：grounding 文本块 + 坐标 → DeepSeek V4-Flash → JSON）
+DEEPSEEK_API_KEY=你的DeepSeek官方API密钥
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+EXPENSE_TRACKER_LLM_MODEL=deepseek-v4-flash
+
+# SiliconFlow（旧版外部模型通道，当前链路不再使用）
 SILICONFLOW_API_KEY=你的API密钥
 SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
 
@@ -31,8 +37,28 @@ LANGSMITH_PROJECT=expense-tracker
 EXPENSE_TRACKER_ENABLE_LANGSMITH=true
 ```
 
+- `DEEPSEEK_API_KEY` 是 **DeepSeek 官方 API** 密钥（https://platform.deepseek.com 获取）。仅在 GUI 勾选「Use DeepSeek V4-Flash (external)」时使用，将本地 OCR 的文本输出交给 DeepSeek V4-Flash 转成结构化 JSON，思考功能已关闭。
 - `EXPENSE_TRACKER_ENABLE_LANGSMITH=true` 开启 LangSmith 追踪；不需要可设为 `false`
-- `SILICONFLOW_API_KEY` 是 SiliconFlow 多模态模型调用的必要配置
+- 默认 OCR 链路（本地 GLM OCR，`ocr_service\llama\` 部署，见 `GLM-OCR本地部署指南.md`）**不需要任何 API key**
+
+### GLM-OCR 模型文件下载
+
+默认本地 OCR 链路需要两个 GLM-OCR 量化模型文件（合计约 1.4GB），**不包含在 git 仓库中**，首次使用需手动下载：
+
+| 文件 | 大小 | 说明 |
+|------|------|------|
+| `GLM-OCR-Q8_0.gguf` | 906MB | GLM-OCR 主模型 |
+| `mmproj-GLM-OCR-Q8_0.gguf` | 462MB | 视觉投影器（OCR 必需） |
+
+**下载地址**：https://huggingface.co/ggml-org/GLM-OCR-GGUF
+
+下载后将两个文件放入以下目录（目录不存在则创建）：
+
+```text
+ocr_service/llama/models/
+```
+
+放置完成后可通过 `ocr_service\start-llama.bat` 启动本地 OCR 服务。完整部署说明见 `GLM-OCR本地部署指南.md`。
 
 ### 归属人配置
 
@@ -190,7 +216,7 @@ Store: C:\...\data\receipts.json | Reports: C:\...\reports
 4. 成功后会弹出提示，左侧列表刷新显示新小票
 5. 失败后会弹出错误提示，可在 **Failed OCR** 标签页查看详情
 
-**使用前提**：`.env` 中已配置 `SILICONFLOW_API_KEY`。
+**使用前提**：默认本地 OCR 链路无需任何 API key；若勾选「Use DeepSeek V4-Flash (external)」，需在 `.env` 中配置 `DEEPSEEK_API_KEY`。
 
 ---
 

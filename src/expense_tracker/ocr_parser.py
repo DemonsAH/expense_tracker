@@ -4,6 +4,8 @@ Handles German supermarket receipts (dm, REWE) with multiple layouts:
   1. dm: 3-column table  (name | price | qty)
   2. REWE text-items: items in pre-table text, prices in 2-col table
   3. REWE merged: complex multi-column with colspan
+
+This is a fully local parser that does not require any external API key.
 """
 
 from __future__ import annotations

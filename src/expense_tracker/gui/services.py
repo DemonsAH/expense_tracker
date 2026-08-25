@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import webbrowser
 from dataclasses import dataclass
@@ -31,6 +32,59 @@ class AppPaths:
     rejected_dir: Path
 
 
+# 自动化处理流目录：receipt_input/未处理 -> 已处理 -> 已校对
+RECEIPT_INPUT_DIR = "receipt_input"
+INCOMING_DIR = "未处理"
+PROCESSED_DIR = "已处理"
+REVIEWED_DIR = "已校对"
+
+
+def receipt_flow_dirs(project_root: str | Path) -> tuple[Path, Path, Path]:
+    base = Path(project_root) / RECEIPT_INPUT_DIR
+    return base / INCOMING_DIR, base / PROCESSED_DIR, base / REVIEWED_DIR
+
+
+def ensure_receipt_flow_dirs(project_root: str | Path) -> None:
+    for directory in receipt_flow_dirs(project_root):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+def _build_unique_destination(path: Path) -> Path:
+    if not path.exists():
+        return path
+    counter = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def move_verified_receipt_image(
+    project_root: str | Path,
+    image_path: str,
+    receipt_id: str,
+) -> str | None:
+    """把已校对小票的图片从 已处理/ 移到 已校对/，并按 receipt id 重命名。
+
+    仅当图片位于 receipt_input/已处理/ 下时才移动；否则原样返回（不越权移动
+    其它目录的图片）。返回新路径，无需移动时返回 None。
+    """
+    if not image_path:
+        return None
+    source = Path(image_path)
+    _, processed_dir, reviewed_dir = receipt_flow_dirs(project_root)
+    try:
+        source.relative_to(processed_dir)
+    except ValueError:
+        return None
+
+    destination = _build_unique_destination(reviewed_dir / f"{receipt_id}{source.suffix}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(destination))
+    return str(destination)
+
+
 @dataclass
 class ReportListEntry:
     report_month: str
@@ -42,6 +96,22 @@ class ReportListEntry:
 
 def _is_frozen() -> bool:
     return getattr(sys, "frozen", False)
+
+
+def exe_build_time() -> str:
+    """Return the build timestamp of the running executable, for GUI display.
+
+    In a frozen (PyInstaller) build the timestamp is read from the exe file
+    itself (i.e. when it was last packaged); when running from source, report
+    that mode instead so the user knows this is not the packaged exe.
+    """
+    if not _is_frozen():
+        return "源码模式"
+    try:
+        mtime = Path(sys.executable).stat().st_mtime
+    except OSError:
+        return "未知"
+    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
 
 
 def find_project_root(start: Path | None = None) -> Path:
@@ -135,6 +205,65 @@ def _to_decimal(value: Any, field_name: str) -> Decimal:
         raise ValueError(f"Invalid decimal value for {field_name}.") from exc
 
 
+def step_down_items(items: list[dict], indices: list[int]) -> None:
+    """把选中 item 的价格整体下移一位，用于修复称重小票金额错位。
+
+    就地修改 items：在最后一个选中项之后插入一个新 item（名字为 "new"，
+    价格为最后一个选中项的价格）；然后选中项的价格依次向前一个选中项复制
+    （最后一个 ← 倒数第二个，…，第二个 ← 第一个）；第一个选中项价格置 0。
+    indices 会被去重并按升序排序。
+    """
+    selection = sorted(set(indices))
+    if not selection:
+        return
+
+    last_index = selection[-1]
+    new_item = dict(items[last_index])
+    new_item["name"] = "new"
+    new_item["normalized_name"] = "new"
+
+    for index in range(len(selection) - 1, 0, -1):
+        items[selection[index]]["total_price"] = items[selection[index - 1]]["total_price"]
+    items[selection[0]]["total_price"] = "0.00"
+
+    items.insert(last_index + 1, new_item)
+
+
+def is_splittable_item(item: dict) -> bool:
+    """quantity 为大于 1 的整数时可拆分为多个 quantity=1 的 item。"""
+    try:
+        quantity = Decimal(str(item.get("quantity")))
+    except Exception:
+        return False
+    return quantity == int(quantity) and quantity > 1
+
+
+def split_quantity_items(items: list[dict], indices: list[int]) -> list[int]:
+    """把选中的 quantity>1 整数 item 拆成多个 quantity=1 的 item（就地修改）。
+
+    每个拆分项继承原项的名称/品类/单价/归属，quantity=1、total_price=unit_price
+    （拆分前后总额一致），id 清空（保存时由 save_receipt_edit 重新生成）。
+    返回实际被拆分的 item 原始索引列表；跳过非可拆分项。
+    """
+    targets = [i for i in sorted(set(indices)) if is_splittable_item(items[i])]
+    for index in reversed(targets):
+        item = items[index]
+        count = int(Decimal(str(item["quantity"])))
+        unit = Decimal(str(item["unit_price"]))
+        split_items = [
+            {
+                **item,
+                "id": "",
+                "quantity": "1",
+                "unit_price": f"{unit:.2f}",
+                "total_price": f"{unit:.2f}",
+            }
+            for _ in range(count)
+        ]
+        items[index:index + 1] = split_items
+    return targets
+
+
 def _parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value.strip())
@@ -223,8 +352,14 @@ def save_receipt_edit(
     now = datetime.now(timezone.utc)
     created_at = existing.created_at if existing else now
     reviewed_at = existing.reviewed_at if existing else None
-    if receipt_data.get("is_verified") and reviewed_at is None:
+    is_verified = bool(receipt_data.get("is_verified", False))
+    if is_verified and reviewed_at is None:
         reviewed_at = now
+    # A verified receipt is confirmed by a human: promote the status.
+    if is_verified:
+        ocr_status = OcrStatus.VERIFIED
+    else:
+        ocr_status = OcrStatus(str(receipt_data.get("ocr_status") or OcrStatus.PENDING.value).strip())
 
     image_path = str(receipt_data.get("image_path") or "").strip() or f"manual://{receipt_id}"
     image_hash = str(receipt_data.get("image_hash") or "").strip() or f"manual-hash::{receipt_id}"
@@ -242,8 +377,8 @@ def save_receipt_edit(
         image_path=image_path,
         image_hash=image_hash,
         ocr_raw_text=receipt_data.get("ocr_raw_text"),
-        is_verified=bool(receipt_data.get("is_verified", False)),
-        ocr_status=OcrStatus(str(receipt_data.get("ocr_status") or OcrStatus.PENDING.value).strip()),
+        is_verified=is_verified,
+        ocr_status=ocr_status,
         ocr_attempts=int(receipt_data.get("ocr_attempts") or 0),
         ocr_failure_reason=(str(receipt_data["ocr_failure_reason"]).strip() or None) if receipt_data.get("ocr_failure_reason") else None,
         review_notes=(str(receipt_data["review_notes"]).strip() or None) if receipt_data.get("review_notes") else None,
@@ -253,6 +388,13 @@ def save_receipt_edit(
         items=built_items,
         removed_items=built_removed_items,
     )
+
+    # 人工确认（verify）后：把图片从 已处理/ 移到 已校对/（按 receipt id 重命名），
+    # 并更新记录里的路径。
+    if is_verified and image_path and not image_path.startswith("manual://"):
+        moved_image = move_verified_receipt_image(paths.project_root, image_path, receipt_id)
+        if moved_image:
+            record.image_path = moved_image
 
     if is_new:
         store.receipts.append(record)
@@ -367,22 +509,81 @@ def open_html_report(path: str | Path) -> None:
     webbrowser.open(target.resolve().as_uri())
 
 
-def trigger_ingestion(paths: AppPaths, image_path: str | Path) -> str:
-    """Trigger a single receipt ingestion pipeline from the GUI (PRD 8.1)."""
+def _move_source_to_processed(
+    project_root: str | Path,
+    image_path: str | Path,
+    receipt_id: str,
+) -> str | None:
+    """把源图片移动到 已处理/ 并按 receipt id 重命名（无论来源在哪里）。
+
+    trigger 成功后调用：不管图片在"未处理"、桌面还是其它位置，都统一归档
+    为 {receipt_id}{suffix}，保证后续 verify 能正常流转进 已校对/。图片已经
+    在目标位置且名字一致时返回 None（幂等）。返回新路径。
+    """
+    source = Path(image_path)
+    if not source.exists():
+        return None
+    _, processed_dir, _ = receipt_flow_dirs(project_root)
+    target = processed_dir / f"{receipt_id}{source.suffix}"
+    try:
+        if source.resolve() == target.resolve():
+            return None
+    except OSError:
+        pass
+
+    destination = _build_unique_destination(target)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(destination))
+    return str(destination)
+
+
+def _update_receipt_image_path(store_path: str | Path, receipt_id: str, new_image_path: str) -> None:
+    store = load_receipt_store(store_path)
+    for receipt in store.receipts:
+        if receipt.id == receipt_id:
+            receipt.image_path = new_image_path
+            break
+    save_receipt_store(store, store_path)
+
+
+def trigger_ingestion(
+    paths: AppPaths,
+    image_path: str | Path,
+    *,
+    use_llm_parser: bool = False,
+    use_preprocess: bool = False,
+) -> tuple[str, str, dict | None]:
+    """Trigger a single receipt ingestion pipeline from the GUI (PRD 8.1).
+
+    Returns (receipt_id, raw_ocr_text, preprocess_info).
+    """
     from expense_tracker.pipelines.receipt_ingestion import ingest_receipt_with_retries
-    from expense_tracker.storage.json_store import load_receipt_store, save_receipt_store
 
     image = Path(image_path)
     if not image.exists():
         raise FileNotFoundError(image)
 
-    result = ingest_receipt_with_retries(
-        image_path=image,
-        owners_path=paths.owners_path,
-        store_path=paths.store_path,
-        max_attempts=3,
-    )
-    return result.receipt_record.id
+    from expense_tracker.pipelines.receipt_ingestion import ReceiptAttemptError
+
+    try:
+        result = ingest_receipt_with_retries(
+            image_path=image,
+            owners_path=paths.owners_path,
+            store_path=paths.store_path,
+            max_attempts=3,
+            use_llm_parser=use_llm_parser,
+            use_preprocess=use_preprocess,
+            failure_output_dir=paths.rejected_dir,
+        )
+        receipt_id = result.receipt_record.id
+        # 无论图片来自哪个目录，处理成功后都统一移入"已处理"并按 receipt id
+        # 重命名，保证 verify 后能正常流转进"已校对"。
+        moved_image = _move_source_to_processed(paths.project_root, image, receipt_id)
+        if moved_image:
+            _update_receipt_image_path(paths.store_path, receipt_id, moved_image)
+        return receipt_id, result.content, result.preprocess_info
+    except ReceiptAttemptError as exc:
+        raise ReceiptAttemptError(str(exc), content=exc.content) from exc
 
 
 def reopen_failed_receipt(paths: AppPaths, failed_index: int) -> str:

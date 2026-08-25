@@ -1,4 +1,4 @@
-"""LangChain chat model factory for SiliconFlow-hosted Qwen models."""
+"""OpenAI-compatible LLM client for SiliconFlow-hosted models."""
 
 from __future__ import annotations
 
@@ -7,21 +7,24 @@ import os
 from langchain_openai import ChatOpenAI
 
 from expense_tracker.config import get_required_env, load_dotenv_file
-from expense_tracker.tracing import configure_langsmith_tracing_env
 
 
-def build_qwen_chat_model(
+def build_chat_model(
     *,
-    model: str = "Qwen/Qwen3.6-27B",
-    temperature: float = 0.1,
-    max_tokens: int = 3000,
+    model: str | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 4096,
 ) -> ChatOpenAI:
-    """Build a LangChain chat client against SiliconFlow's OpenAI-compatible API."""
+    """Build a LangChain ChatOpenAI client against SiliconFlow's API.
+
+    Reads SILICONFLOW_API_KEY, SILICONFLOW_BASE_URL, and
+    EXPENSE_TRACKER_LLM_MODEL from .env.
+    """
     load_dotenv_file()
-    configure_langsmith_tracing_env()
 
     api_key = get_required_env("SILICONFLOW_API_KEY")
     base_url = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+    model = model or os.environ.get("EXPENSE_TRACKER_LLM_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
 
     return ChatOpenAI(
         model=model,
@@ -29,10 +32,4 @@ def build_qwen_chat_model(
         base_url=base_url,
         temperature=temperature,
         max_tokens=max_tokens,
-        model_kwargs={"response_format": {"type": "json_object"}},
-        metadata={
-            "ls_provider": "siliconflow",
-            "ls_model_name": model,
-            "integration": "langchain_openai",
-        },
     )

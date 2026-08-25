@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import tkinter as tk
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from tkinter import messagebox, ttk
+
+from PIL import Image, ImageTk
 
 from expense_tracker.gui.services import (
     AppPaths,
     build_new_receipt_draft,
     default_app_paths,
     delete_receipt,
+    ensure_receipt_flow_dirs,
+    exe_build_time,
     generate_report,
+    is_splittable_item,
     list_reports,
     load_app_state,
     open_html_report,
@@ -21,10 +27,16 @@ from expense_tracker.gui.services import (
     receipt_to_edit_payload,
     reopen_failed_receipt,
     save_receipt_edit,
+    split_quantity_items,
+    step_down_items,
     trigger_ingestion,
 )
+from expense_tracker.pipelines.receipt_ingestion import OCR_PROMPT
 from expense_tracker.schemas.domain import FailedOcrRecord, ReceiptRecord
 from expense_tracker.schemas.enums import ItemCategory, OcrStatus, OwnerMode
+
+# Default zoom factor for the receipt image preview column.
+DEFAULT_IMAGE_ZOOM = 1.3
 
 
 def _previous_month_string(today: date | None = None) -> str:
@@ -100,6 +112,11 @@ class ReceiptItemDialog(tk.Toplevel):
 
         self.bind("<Return>", lambda event: self._submit())
         self.bind("<Escape>", lambda event: self.destroy())
+        # 居中显示在屏幕中央
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
+        y = (self.winfo_screenheight() - self.winfo_reqheight()) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
         self.grab_set()
         self.wait_visibility()
         self.focus()
@@ -119,6 +136,10 @@ class ExpenseTrackerGui(tk.Tk):
         self.title("Expense Tracker GUI")
         self.geometry("1480x900")
         self.minsize(1220, 780)
+        # 自动全屏：F11 切换全屏，Esc 退出全屏
+        self.bind("<F11>", self._toggle_fullscreen)
+        self.bind("<Escape>", self._exit_fullscreen)
+        self.after(50, self._enter_fullscreen)
 
         self.owner_ids: list[str] = []
         self.owner_names: dict[str, str] = {}
@@ -127,6 +148,13 @@ class ExpenseTrackerGui(tk.Tk):
         self.failed_records: list[FailedOcrRecord] = []
         self.report_entries = []
         self._draft_item_counter = 0
+        # 拖拽分配归属时的视觉反馈状态
+        self._drag_ghost: tk.Toplevel | None = None
+        self._drag_start: tuple[int, int] = (0, 0)
+        self._drag_item_name: str | None = None
+        self._receipt_photo = None  # keep reference to avoid GC dropping the image
+        self._image_original = None  # PIL image of the current receipt
+        self._image_zoom = DEFAULT_IMAGE_ZOOM  # initial zoom factor
 
         self._build_style()
         self._build_shell()
@@ -139,10 +167,26 @@ class ExpenseTrackerGui(tk.Tk):
         style.configure("Header.TLabel", font=("Segoe UI", 18, "bold"))
         style.configure("Subtle.TLabel", foreground="#5f6b66")
 
+    def _toggle_fullscreen(self, event: tk.Event | None = None) -> None:
+        # 最大化（保留标题栏）而非无边框全屏
+        if self.state() == "zoomed":
+            self.state("normal")
+        else:
+            self.state("zoomed")
+
+    def _exit_fullscreen(self, event: tk.Event | None = None) -> None:
+        self.state("normal")
+
+    def _enter_fullscreen(self) -> None:
+        self.state("zoomed")
+
     def _build_shell(self) -> None:
         top = ttk.Frame(self, padding=(14, 12))
         top.pack(fill="x")
-        ttk.Label(top, text="Expense Tracker Desktop", style="Header.TLabel").pack(anchor="w")
+        header_row = ttk.Frame(top)
+        header_row.pack(fill="x")
+        ttk.Label(header_row, text="Expense Tracker Desktop", style="Header.TLabel").pack(side="left")
+        ttk.Label(header_row, text=f"Build: {exe_build_time()}", style="Subtle.TLabel").pack(side="right")
         ttk.Label(
             top,
             text=f"Store: {self.paths.store_path} | Reports: {self.paths.reports_dir}",
@@ -158,6 +202,28 @@ class ExpenseTrackerGui(tk.Tk):
         ttk.Button(toolbar, text="Open Image", command=self.open_current_receipt_image).pack(side="left", padx=(8, 0))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(12, 12), pady=2)
         ttk.Button(toolbar, text="Trigger Ingestion", command=self.trigger_ingestion_dialog).pack(side="left")
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(12, 12), pady=2)
+        # GLM OCR 是固定默认引擎，不提供勾选框；勾选此项才切换为外部
+        # DeepSeek V4-Flash 解析（默认开启）。
+        self.use_llm_parser_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            toolbar,
+            text="Use DeepSeek V4-Flash (external)",
+            variable=self.use_llm_parser_var,
+            command=self._on_use_llm_parser_toggled,
+        ).pack(side="left")
+        self.use_preprocess_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toolbar,
+            text="图片预处理（黑底抠图矫正）",
+            variable=self.use_preprocess_var,
+        ).pack(side="left", padx=(10, 0))
+        self.engine_label = ttk.Label(
+            toolbar,
+            text="Engine: DeepSeek V4-Flash (external)" if self.use_llm_parser_var.get() else "Engine: GLM OCR",
+            style="Subtle.TLabel",
+        )
+        self.engine_label.pack(side="left", padx=(10, 0))
 
         # Dashboard stats (PRD 8.1)
         self.stats_frame = ttk.Frame(top)
@@ -189,13 +255,16 @@ class ExpenseTrackerGui(tk.Tk):
         self.receipts_tab = ttk.Frame(notebook, padding=10)
         self.failed_tab = ttk.Frame(notebook, padding=10)
         self.reports_tab = ttk.Frame(notebook, padding=10)
+        self.log_tab = ttk.Frame(notebook, padding=10)
         notebook.add(self.receipts_tab, text="Receipts")
         notebook.add(self.failed_tab, text="Failed OCR")
         notebook.add(self.reports_tab, text="Reports")
+        notebook.add(self.log_tab, text="Log")
 
         self._build_receipts_tab()
         self._build_failed_tab()
         self._build_reports_tab()
+        self._build_log_tab()
 
     def _build_receipts_tab(self) -> None:
         paned = ttk.Panedwindow(self.receipts_tab, orient="horizontal")
@@ -203,18 +272,31 @@ class ExpenseTrackerGui(tk.Tk):
 
         left = ttk.Frame(paned)
         right = ttk.Frame(paned)
+        owner_pane = ttk.Frame(paned)
+        image_pane = ttk.Frame(paned)
         paned.add(left, weight=1)
         paned.add(right, weight=3)
+        paned.add(owner_pane, weight=1)
+        paned.add(image_pane, weight=2)
+
+        # Owner 归属槽（详情与图片预览之间）：把 Formal Items 里选中的行
+        # 拖到某个槽上松开，即可批量把该 owner 分配给这些 item。
+        self.owner_slots: dict[str, tk.Label] = {}
+        ttk.Label(owner_pane, text="Assign Owner", style="Subtle.TLabel").pack(anchor="w", pady=(0, 4))
+        self.owner_slots_frame = ttk.Frame(owner_pane)
+        self.owner_slots_frame.pack(fill="both", expand=True)
 
         ttk.Label(left, text="Scanned Receipts").pack(anchor="w", pady=(0, 6))
         self.receipt_tree = ttk.Treeview(
             left,
-            columns=("merchant", "date", "total", "status"),
-            show="headings",
+            columns=("date", "total", "status"),
+            show="tree headings",
             selectmode="browse",
         )
+        # 树列 #0 显示月份节点/小票 ID，其余三列显示日期/金额/状态
+        self.receipt_tree.heading("#0", text="ID")
+        self.receipt_tree.column("#0", width=120, anchor="w")
         for column, heading, width in (
-            ("merchant", "Merchant", 180),
             ("date", "Date", 90),
             ("total", "Total", 90),
             ("status", "Status", 100),
@@ -223,6 +305,27 @@ class ExpenseTrackerGui(tk.Tk):
             self.receipt_tree.column(column, width=width, anchor="w")
         self.receipt_tree.pack(fill="both", expand=True)
         self.receipt_tree.bind("<<TreeviewSelect>>", self._on_receipt_selected)
+
+        # Dedicated image column on the right (scrollable both ways, wheel zoom).
+        ttk.Label(image_pane, text="Receipt Image").grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 6), pady=(0, 6))
+        self.image_canvas = tk.Canvas(image_pane, highlightthickness=0, width=300)
+        image_vscroll = ttk.Scrollbar(image_pane, orient="vertical", command=self.image_canvas.yview)
+        image_hscroll = ttk.Scrollbar(image_pane, orient="horizontal", command=self.image_canvas.xview)
+        image_host = ttk.Frame(self.image_canvas)
+        image_host.bind("<Configure>", lambda event: self.image_canvas.configure(scrollregion=self.image_canvas.bbox("all")))
+        self.image_canvas.create_window((0, 0), window=image_host, anchor="nw")
+        self.image_canvas.configure(
+            yscrollcommand=image_vscroll.set,
+            xscrollcommand=image_hscroll.set,
+        )
+        self.image_canvas.grid(row=1, column=0, sticky="nsew")
+        image_vscroll.grid(row=1, column=1, sticky="ns")
+        image_hscroll.grid(row=2, column=0, sticky="ew")
+        image_pane.rowconfigure(1, weight=1)
+        image_pane.columnconfigure(0, weight=1)
+        self.receipt_image_label = ttk.Label(image_host, text="No image loaded", anchor="center", justify="center")
+        self.receipt_image_label.pack(fill="both", expand=True)
+        self.receipt_image_label.bind("<MouseWheel>", self._on_image_wheel)
 
         canvas = tk.Canvas(right, highlightthickness=0)
         scroll = ttk.Scrollbar(right, orient="vertical", command=canvas.yview)
@@ -233,8 +336,51 @@ class ExpenseTrackerGui(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
+        # Formal Items 块放最前（在字段表单之前）
+        self.is_verified_var = tk.BooleanVar(value=False)
+        items_frame = ttk.LabelFrame(form_host, text="Formal Items", padding=12)
+        items_frame.pack(fill="both", expand=True)
+        item_toolbar = ttk.Frame(items_frame)
+        item_toolbar.pack(fill="x", pady=(0, 6))
+        ttk.Button(item_toolbar, text="Add Item", command=self.add_item).pack(side="left")
+        ttk.Button(item_toolbar, text="Edit Item", command=self.edit_selected_item).pack(side="left", padx=(8, 0))
+        ttk.Button(item_toolbar, text="Delete Item", command=self.delete_selected_item).pack(side="left", padx=(8, 0))
+        ttk.Button(item_toolbar, text="Step Down", command=self.step_down_selected_items).pack(side="left", padx=(8, 0))
+        # 拆分下拉：quantity>1 整数的 item 可拆成多个 quantity=1 的 item
+        ttk.Label(item_toolbar, text="Split:").pack(side="left", padx=(8, 0))
+        self.split_combo = ttk.Combobox(item_toolbar, state="readonly", width=26)
+        self.split_combo.pack(side="left", padx=(4, 0))
+        self.split_combo.bind("<<ComboboxSelected>>", self._on_split_selected)
+        # Verify 勾选框放在 Formal Items 工具栏最右侧
+        ttk.Checkbutton(item_toolbar, text="Verified", variable=self.is_verified_var).pack(side="right", padx=(0, 4))
+
+        self.items_tree = ttk.Treeview(
+            items_frame,
+            columns=("name", "category", "quantity", "unit_price", "total_price", "owner"),
+            show="headings",
+            height=8,
+            selectmode="extended",
+        )
+        for column, heading, width in (
+            ("name", "Name", 180),
+            ("category", "Category", 100),
+            ("quantity", "Qty", 70),
+            ("unit_price", "Unit", 80),
+            ("total_price", "Total", 80),
+            ("owner", "Owner", 100),
+        ):
+            self.items_tree.heading(column, text=heading)
+            self.items_tree.column(column, width=width, anchor="w")
+        self.items_tree.pack(fill="both", expand=True)
+        # 双击行直接打开 Edit Item 对话框
+        self.items_tree.bind("<Double-1>", lambda event: self.edit_selected_item())
+        # 拖拽到 Owner 归属槽松手时批量分配归属（带 item name 跟随鼠标的反馈）
+        self.items_tree.bind("<ButtonPress-1>", self._on_item_press)
+        self.items_tree.bind("<B1-Motion>", self._on_item_motion)
+        self.items_tree.bind("<ButtonRelease-1>", self._on_item_release)
+
         form = ttk.LabelFrame(form_host, text="Receipt Details", padding=12)
-        form.pack(fill="x", expand=True)
+        form.pack(fill="x", pady=(10, 0))
         self.receipt_vars = {
             "id": tk.StringVar(),
             "merchant": tk.StringVar(),
@@ -251,7 +397,6 @@ class ExpenseTrackerGui(tk.Tk):
             "ocr_attempts": tk.StringVar(value="0"),
             "ocr_failure_reason": tk.StringVar(),
         }
-        self.is_verified_var = tk.BooleanVar(value=False)
 
         row = 0
         self._form_entry(form, row, "Receipt ID", self.receipt_vars["id"], state="readonly"); row += 1
@@ -268,9 +413,6 @@ class ExpenseTrackerGui(tk.Tk):
         self.ocr_status_combo = self._form_combo(form, row, "OCR Status", self.receipt_vars["ocr_status"], [status.value for status in OcrStatus]); row += 1
         self._form_entry(form, row, "OCR Attempts", self.receipt_vars["ocr_attempts"]); row += 1
         self._form_entry(form, row, "OCR Failure", self.receipt_vars["ocr_failure_reason"]); row += 1
-        ttk.Label(form, text="Verified").grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
-        ttk.Checkbutton(form, variable=self.is_verified_var).grid(row=row, column=1, sticky="w", pady=4)
-        row += 1
 
         ttk.Label(form, text="Review Notes").grid(row=row, column=0, sticky="nw", padx=(0, 12), pady=(6, 4))
         self.review_notes_text = tk.Text(form, height=4, width=45)
@@ -280,32 +422,6 @@ class ExpenseTrackerGui(tk.Tk):
         self.ocr_raw_text = tk.Text(form, height=6, width=45)
         self.ocr_raw_text.grid(row=row, column=1, sticky="ew", pady=(6, 4))
         form.columnconfigure(1, weight=1)
-
-        items_frame = ttk.LabelFrame(form_host, text="Formal Items", padding=12)
-        items_frame.pack(fill="both", expand=True, pady=(10, 0))
-        item_toolbar = ttk.Frame(items_frame)
-        item_toolbar.pack(fill="x", pady=(0, 6))
-        ttk.Button(item_toolbar, text="Add Item", command=self.add_item).pack(side="left")
-        ttk.Button(item_toolbar, text="Edit Item", command=self.edit_selected_item).pack(side="left", padx=(8, 0))
-        ttk.Button(item_toolbar, text="Delete Item", command=self.delete_selected_item).pack(side="left", padx=(8, 0))
-
-        self.items_tree = ttk.Treeview(
-            items_frame,
-            columns=("name", "category", "quantity", "unit_price", "total_price", "owner"),
-            show="headings",
-            height=8,
-        )
-        for column, heading, width in (
-            ("name", "Name", 180),
-            ("category", "Category", 100),
-            ("quantity", "Qty", 70),
-            ("unit_price", "Unit", 80),
-            ("total_price", "Total", 80),
-            ("owner", "Owner", 100),
-        ):
-            self.items_tree.heading(column, text=heading)
-            self.items_tree.column(column, width=width, anchor="w")
-        self.items_tree.pack(fill="both", expand=True)
 
         removed_frame = ttk.LabelFrame(form_host, text="Removed Audit Items", padding=12)
         removed_frame.pack(fill="both", expand=True, pady=(10, 0))
@@ -374,6 +490,39 @@ class ExpenseTrackerGui(tk.Tk):
             self.reports_tree.column(column, width=width, anchor="w")
         self.reports_tree.pack(fill="both", expand=True)
 
+    def _build_log_tab(self) -> None:
+        log_frame = ttk.Frame(self.log_tab)
+        log_frame.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_frame, wrap="word", font=("Consolas", 10))
+        scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.log_text.pack(fill="both", expand=True)
+        self.log_text.insert("end", "--- OCR Log started ---\n")
+        self.log_text.configure(state="disabled")
+
+    def log_message(self, msg: str) -> None:
+        self.log_text.configure(state="normal")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert("end", f"[{ts}] {msg}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _on_use_llm_parser_toggled(self) -> None:
+        """Toggle the external DeepSeek V4-Flash parser backend.
+
+        When enabled, grounding blocks (text + bounding boxes) from the local
+        OCR model are sent to DeepSeek V4-Flash which converts them into the
+        ExtractedReceipt JSON (thinking mode disabled).
+        """
+        if self.use_llm_parser_var.get():
+            self.engine_label.configure(text="Engine: DeepSeek V4-Flash (external)")
+            self.status_var.set("External parser enabled: OCR text -> DeepSeek V4-Flash")
+            self.log_message("External parser enabled: OCR text -> DeepSeek V4-Flash (thinking disabled)")
+        else:
+            self.engine_label.configure(text="Engine: GLM OCR")
+            self.status_var.set("Using local GLM OCR (no API key required)")
+
     def _form_entry(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, *, state: str = "normal") -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
         ttk.Entry(parent, textvariable=variable, width=48, state=state).grid(row=row, column=1, sticky="ew", pady=4)
@@ -417,10 +566,39 @@ class ExpenseTrackerGui(tk.Tk):
         )
         if not file_path:
             return
+        self.log_message(f"OCR Prompt ({len(OCR_PROMPT)} chars):\n{OCR_PROMPT}")
+        self.log_message(f"Processing: {file_path}")
+        use_llm_parser = self.use_llm_parser_var.get()
+        use_preprocess = self.use_preprocess_var.get()
+        if use_llm_parser:
+            self.log_message("Engine: DeepSeek V4-Flash (external parser, thinking disabled)")
+        if use_preprocess:
+            self.log_message("Image preprocessing enabled: 黑底抠图 + 透视矫正")
         try:
-            receipt_id = trigger_ingestion(self.paths, file_path)
+            receipt_id, raw_text, preprocess_info = trigger_ingestion(
+                self.paths,
+                file_path,
+                use_llm_parser=use_llm_parser,
+                use_preprocess=use_preprocess,
+            )
+            if preprocess_info:
+                self.log_message(
+                    f"Preprocess: method={preprocess_info.get('method')} "
+                    f"found_receipt={preprocess_info.get('found_receipt')} "
+                    f"info={preprocess_info.get('info')}"
+                )
+            self.log_message(f"SUCCESS: receipt_id={receipt_id}")
+            self.log_message(f"OCR Raw Output ({len(raw_text)} chars):\n{raw_text}")
             messagebox.showinfo("Ingestion Complete", f"Receipt {receipt_id} processed successfully.", parent=self)
         except Exception as exc:
+            raw = getattr(exc, "content", None)
+            print(f"[DEBUG] exc type={type(exc).__name__} exc={exc!r}")
+            print(f"[DEBUG] raw type={type(raw).__name__} raw={raw!r}")
+            import traceback
+            traceback.print_exc()
+            if raw:
+                self.log_message(f"OCR Raw Output (failed, {len(raw)} chars):\n{raw}")
+            self.log_message(f"FAILED: {exc}")
             messagebox.showerror("Ingestion Failed", str(exc), parent=self)
             return
         self.refresh_all()
@@ -430,22 +608,49 @@ class ExpenseTrackerGui(tk.Tk):
         self.owner_ids = [owner.id for owner in owners.owners]
         self.owner_names = {owner.id: owner.name for owner in owners.owners}
         self.receipt_index = {receipt.id: receipt for receipt in store.receipts}
+
+        # 记录用户已展开的月份节点，刷新后恢复（首次打开时默认只展开当前月份）
+        open_months = {
+            item
+            for item in self.receipt_tree.get_children()
+            if self.receipt_tree.item(item, "open")
+        }
         for tree_item in self.receipt_tree.get_children():
             self.receipt_tree.delete(tree_item)
-        for receipt in sorted(store.receipts, key=lambda item: item.purchase_date, reverse=True):
+
+        # 按月份分组：月份节点为父行，该月小票为子行
+        month_items: dict[str, list[ReceiptRecord]] = {}
+        for receipt in store.receipts:
+            month_items.setdefault(receipt.purchase_date.strftime("%Y-%m"), []).append(receipt)
+
+        current_month = date.today().strftime("%Y-%m")
+        for month in sorted(month_items, reverse=True):
+            receipts = month_items[month]
+            parent = f"month:{month}"
+            month_label = f"{month} ({len(receipts)})"
             self.receipt_tree.insert(
                 "",
                 "end",
-                iid=receipt.id,
-                values=(
-                    receipt.merchant,
-                    receipt.purchase_date.isoformat(),
-                    f"{receipt.total_amount:.2f}",
-                    receipt.ocr_status.value,
-                ),
+                iid=parent,
+                text=month_label,
+                values=("", "", ""),
+                open=(month in open_months or month == current_month),
             )
+            for receipt in sorted(receipts, key=lambda item: item.purchase_date, reverse=True):
+                self.receipt_tree.insert(
+                    parent,
+                    "end",
+                    iid=receipt.id,
+                    text=receipt.id,
+                    values=(
+                        receipt.purchase_date.isoformat(),
+                        f"{receipt.total_amount:.2f}",
+                        receipt.ocr_status.value,
+                    ),
+                )
 
         self.default_owner_combo.configure(values=self.owner_ids)
+        self._refresh_owner_slots()
 
         if self.current_receipt_payload and self.current_receipt_payload.get("id") in self.receipt_index:
             self.load_receipt_into_form(self.receipt_index[self.current_receipt_payload["id"]])
@@ -454,6 +659,16 @@ class ExpenseTrackerGui(tk.Tk):
             self.load_receipt_into_form(first_receipt)
         else:
             self.new_receipt()
+
+    def _reveal_receipt(self, receipt_id: str) -> None:
+        """在树中展开该小票所在月份并选中它（滚动到可见位置）。"""
+        receipt = self.receipt_index.get(receipt_id)
+        if receipt is None:
+            return
+        self.receipt_tree.item(f"month:{receipt.purchase_date.strftime('%Y-%m')}", open=True)
+        self.receipt_tree.selection_set(receipt_id)
+        self.receipt_tree.focus(receipt_id)
+        self.receipt_tree.see(receipt_id)
 
     def refresh_failed_records(self) -> None:
         store = load_app_state(self.paths)[0]
@@ -513,13 +728,77 @@ class ExpenseTrackerGui(tk.Tk):
         self.review_notes_text.insert("1.0", payload.get("review_notes", ""))
         self.ocr_raw_text.delete("1.0", "end")
         self.ocr_raw_text.insert("1.0", payload.get("ocr_raw_text", ""))
+        self._load_receipt_image(payload.get("image_path", ""))
         self._refresh_items_tree()
         self._refresh_removed_tree()
+
+    def _load_receipt_image(self, image_path: str) -> None:
+        """Load and display the receipt image in the details form.
+
+        The path may be absolute or relative to the project root; a missing or
+        unreadable file simply shows a placeholder text. The image starts at
+        the default zoom and the mouse wheel adjusts the zoom factor.
+        """
+        if not image_path:
+            self._image_original = None
+            self._image_zoom = DEFAULT_IMAGE_ZOOM
+            self.receipt_image_label.configure(text="No image loaded")
+            self._receipt_photo = None
+            return
+
+        path = Path(image_path)
+        if not path.is_absolute():
+            path = self.paths.project_root / path
+
+        try:
+            self._image_original = Image.open(path)
+        except Exception:
+            self._image_original = None
+            self._image_zoom = DEFAULT_IMAGE_ZOOM
+            self.receipt_image_label.configure(text="Image not found")
+            self._receipt_photo = None
+            return
+
+        self._image_zoom = DEFAULT_IMAGE_ZOOM
+        self._render_receipt_image()
+
+    def _render_receipt_image(self) -> None:
+        """Render the current receipt image at the current zoom factor."""
+        if self._image_original is None:
+            return
+
+        width = max(1, int(self._image_original.width * self._image_zoom))
+        height = max(1, int(self._image_original.height * self._image_zoom))
+        # Cap the rendered size to keep memory reasonable while still allowing
+        # close inspection of small receipt text.
+        max_side = 2400
+        if max(width, height) > max_side:
+            scale = max_side / max(width, height)
+            width = max(1, int(width * scale))
+            height = max(1, int(height * scale))
+
+        img = self._image_original.resize((width, height), Image.LANCZOS)
+        self._receipt_photo = ImageTk.PhotoImage(img)
+        self.receipt_image_label.configure(
+            image=self._receipt_photo,
+            text="",
+            compound="center",
+        )
+
+    def _on_image_wheel(self, event) -> None:
+        """Zoom the receipt image with the mouse wheel (up = zoom in)."""
+        if self._image_original is None:
+            return
+        factor = 1.15 if event.delta > 0 else 1 / 1.15
+        self._image_zoom = min(12.0, max(0.25, self._image_zoom * factor))
+        self._render_receipt_image()
 
     def _refresh_items_tree(self) -> None:
         for item in self.items_tree.get_children():
             self.items_tree.delete(item)
         payload = self.current_receipt_payload or {"items": []}
+        # 默认显示所有 item：树高随 item 数量自适应（至少 5 行）
+        self.items_tree.configure(height=max(len(payload.get("items", [])), 5))
         for index, item in enumerate(payload.get("items", [])):
             self.items_tree.insert(
                 "",
@@ -534,6 +813,99 @@ class ExpenseTrackerGui(tk.Tk):
                     self.owner_names.get(item["owner_id"], item["owner_id"]),
                 ),
             )
+        self._refresh_split_combo()
+
+    def _refresh_owner_slots(self) -> None:
+        """按当前 owners 配置重建"Assign Owner"槽（拖拽目标）。"""
+        for child in self.owner_slots_frame.winfo_children():
+            child.destroy()
+        self.owner_slots.clear()
+        for owner_id in self.owner_ids:
+            name = self.owner_names.get(owner_id, owner_id)
+            slot = tk.Label(
+                self.owner_slots_frame,
+                text=f"{name}\n({owner_id})",
+                justify="center",
+                anchor="center",
+                relief="groove",
+                bd=1,
+                padx=6,
+                pady=12,
+                bg="#f2f5f4",
+            )
+            slot.pack(fill="x", pady=(4, 0))
+            slot.bind("<Enter>", lambda event, s=slot: s.configure(bg="#cfe3f7"))
+            slot.bind("<Leave>", lambda event, s=slot: s.configure(bg="#f2f5f4"))
+            self.owner_slots[owner_id] = slot
+
+    def _on_item_press(self, event: tk.Event) -> None:
+        """按下 items 行：记录起点，准备拖拽反馈。"""
+        self._drag_ghost = None
+        self._drag_start = (event.x_root, event.y_root)
+        self._drag_item_name = None
+        selection = self.items_tree.selection()
+        payload = self.current_receipt_payload
+        if selection and payload and selection[0].isdigit():
+            index = int(selection[0])
+            if 0 <= index < len(payload["items"]):
+                self._drag_item_name = payload["items"][index]["name"]
+
+    def _on_item_motion(self, event: tk.Event) -> None:
+        """拖动中：让 item name 跟随鼠标显示（小悬浮标签）。"""
+        if self._drag_item_name is None:
+            return
+        dx = event.x_root - self._drag_start[0]
+        dy = event.y_root - self._drag_start[1]
+        if self._drag_ghost is None:
+            if abs(dx) < 5 and abs(dy) < 5:
+                return
+            ghost = tk.Toplevel(self)
+            ghost.overrideredirect(True)
+            ghost.attributes("-topmost", True)
+            tk.Label(
+                ghost,
+                text=self._drag_item_name,
+                bg="#ffffcc",
+                relief="solid",
+                bd=1,
+                padx=6,
+                pady=2,
+            ).pack()
+            self._drag_ghost = ghost
+        self._drag_ghost.geometry(f"+{event.x_root + 12}+{event.y_root + 8}")
+
+    def _on_item_release(self, event: tk.Event) -> None:
+        """松开：销毁跟随标签，执行归属分配。"""
+        if self._drag_ghost is not None:
+            self._drag_ghost.destroy()
+            self._drag_ghost = None
+        self._drag_item_name = None
+        self._assign_owner_by_drag()
+
+    def _assign_owner_by_drag(self) -> None:
+        """把 Formal Items 中选中的行拖到 Owner 槽上松开时，批量分配 owner。"""
+        selection = self.items_tree.selection()
+        payload = self.current_receipt_payload
+        if not selection or not payload or not self.owner_slots:
+            return
+        x = self.winfo_pointerx()
+        y = self.winfo_pointery()
+        target_owner = None
+        for owner_id, widget in self.owner_slots.items():
+            rx, ry = widget.winfo_rootx(), widget.winfo_rooty()
+            rw, rh = widget.winfo_width(), widget.winfo_height()
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                target_owner = owner_id
+                break
+        if target_owner is None:
+            return
+        indices = sorted(int(iid) for iid in selection if iid.isdigit())
+        for index in indices:
+            payload["items"][index]["owner_id"] = target_owner
+        self._refresh_items_tree()
+        self.status_var.set(
+            f"Assigned {len(indices)} item(s) to {self.owner_names.get(target_owner, target_owner)}"
+        )
 
     def _refresh_removed_tree(self) -> None:
         for item in self.removed_tree.get_children():
@@ -570,8 +942,7 @@ class ExpenseTrackerGui(tk.Tk):
             return
         self.status_var.set(f"Saved {record.id}")
         self.refresh_receipts()
-        self.receipt_tree.selection_set(record.id)
-        self.receipt_tree.focus(record.id)
+        self._reveal_receipt(record.id)
 
     def delete_current_receipt(self) -> None:
         payload = self.current_receipt_payload
@@ -624,6 +995,55 @@ class ExpenseTrackerGui(tk.Tk):
         if index is None or self.current_receipt_payload is None:
             return
         del self.current_receipt_payload["items"][index]
+        self._refresh_items_tree()
+
+    def step_down_selected_items(self) -> None:
+        """Step Down：把选中 item 的价格整体下移一位（修复金额错位）。
+
+        选中项可多选；在最后一个选中项之后插入新 item "new"（价格为最后
+        一个选中项的价格），选中项价格依次后移，第一个选中项价格置 0。
+        """
+        if self.current_receipt_payload is None:
+            self.new_receipt()
+        selection = [int(iid) for iid in self.items_tree.selection()]
+        if not selection:
+            return
+        items = self.current_receipt_payload["items"]
+        step_down_items(items, selection)
+        # 给新插入的 item 分配 draft id（新 item 位于最后一个选中项之后）
+        self._draft_item_counter += 1
+        last_index = max(selection)
+        items[last_index + 1]["id"] = f"draft-item-{self._draft_item_counter}"
+        self._refresh_items_tree()
+
+    def _refresh_split_combo(self) -> None:
+        """重建 Split 下拉：列出当前小票中 quantity>1 整数的 item。"""
+        options = []
+        items = (self.current_receipt_payload or {}).get("items", [])
+        for index, item in enumerate(items):
+            if is_splittable_item(item):
+                options.append(f"#{index}: {item['quantity']} × {item['name']}")
+        self.split_combo.configure(values=options)
+        self.split_combo.set("")
+
+    def _on_split_selected(self, _event) -> None:
+        """把 Split 下拉选中的 item 拆成多个 quantity=1 的 item，可分别设置 owner。"""
+        if self.current_receipt_payload is None:
+            return
+        selection = self.split_combo.get()
+        if not selection:
+            return
+        index = int(selection.lstrip("#").split(":", 1)[0])
+        items = self.current_receipt_payload["items"]
+        count = int(Decimal(str(items[index]["quantity"])))
+        split_quantity_items(items, [index])
+        # 给拆分出的 item 分配 draft id（保存时若未改会自动转正式 id）
+        self._draft_item_counter += 1
+        start = self._draft_item_counter
+        for offset in range(count):
+            items[index + offset]["id"] = f"draft-item-{start + offset}"
+        self._draft_item_counter = start + count - 1
+        self.status_var.set(f"Split item into {count} × qty 1 (set owner per item if needed)")
         self._refresh_items_tree()
 
     def open_current_receipt_image(self) -> None:
@@ -722,6 +1142,8 @@ class ExpenseTrackerGui(tk.Tk):
 
 
 def run_app(paths: AppPaths | None = None) -> None:
+    paths = paths or default_app_paths()
+    ensure_receipt_flow_dirs(paths.project_root)
     app = ExpenseTrackerGui(paths=paths)
     app.mainloop()
 
