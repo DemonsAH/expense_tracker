@@ -52,13 +52,20 @@ class ReceiptItemDialogResult:
 
 
 class ReceiptItemDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, owner_ids: list[str], item_payload: dict | None = None):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        owner_ids: list[str],
+        item_payload: dict | None = None,
+        owner_names: dict[str, str] | None = None,
+    ):
         super().__init__(parent)
         self.title("Receipt Item")
         self.resizable(False, False)
         self.transient(parent)
         self.result: ReceiptItemDialogResult | None = None
         self.owner_ids = owner_ids
+        self.owner_names = owner_names or {}
         payload = item_payload or {
             "id": "",
             "name": "",
@@ -70,6 +77,8 @@ class ReceiptItemDialog(tk.Toplevel):
             "owner_id": owner_ids[0] if owner_ids else "",
             "owner_marker": "",
         }
+        self.existing_splits: list[dict] = list(payload.get("splits") or [])
+        self.split_result: list[dict] | None = None
 
         self.vars = {
             "name": tk.StringVar(value=payload["name"]),
@@ -106,7 +115,105 @@ class ReceiptItemDialog(tk.Toplevel):
             widget.grid(row=row, column=1, sticky="ew", pady=4)
 
         buttons = ttk.Frame(form)
-        buttons.grid(row=len(labels), column=0, columnspan=2, sticky="e", pady=(10, 0))
+        buttons.grid(row=len(labels), column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(buttons, text="Split…", command=self._open_split_dialog).pack(side="left")
+        ok_cancel = ttk.Frame(buttons)
+        ok_cancel.pack(side="right")
+        ttk.Button(ok_cancel, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(ok_cancel, text="OK", command=self._submit).pack(side="right")
+
+        self.bind("<Return>", lambda event: self._submit())
+        self.bind("<Escape>", lambda event: self.destroy())
+        # 居中显示在屏幕中央
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
+        y = (self.winfo_screenheight() - self.winfo_reqheight()) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.grab_set()
+        self.wait_visibility()
+        self.focus()
+
+    def _open_split_dialog(self) -> None:
+        """打开 Split 界面，把所选归属人 + 份数暂存到 self.split_result。"""
+        dialog = ItemSplitDialog(
+            self,
+            self.owner_ids,
+            self.owner_names,
+            self.split_result or self.existing_splits,
+        )
+        self.wait_window(dialog)
+        if dialog.result:
+            self.split_result = dialog.result.splits
+
+    def _submit(self) -> None:
+        payload = {"id": self.item_id}
+        for key, variable in self.vars.items():
+            payload[key] = variable.get().strip()
+        payload["splits"] = self.split_result if self.split_result is not None else self.existing_splits
+        self.result = ReceiptItemDialogResult(payload=payload)
+        self.destroy()
+
+
+@dataclass
+class ItemSplitDialogResult:
+    splits: list[dict]  # [{"owner_id": str, "shares": int}]
+
+
+class ItemSplitDialog(tk.Toplevel):
+    """Split 输入界面：勾选归属人并填写整数份数（仅输入接口，不执行拆分逻辑）。"""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        owner_ids: list[str],
+        owner_names: dict[str, str] | None = None,
+        splits: list[dict] | None = None,
+    ):
+        super().__init__(parent)
+        self.title("Split Item by Owners")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.result: ItemSplitDialogResult | None = None
+        owner_names = owner_names or {}
+        existing = {str(s.get("owner_id")): int(s.get("shares", 1)) for s in (splits or [])}
+
+        form = ttk.Frame(self, padding=14)
+        form.grid(sticky="nsew")
+        ttk.Label(form, text="勾选要分摊的归属人，并填写各归属人的份数（正整数）：").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
+
+        def _validate_int(value: str) -> bool:
+            return value.isdigit() or value == ""
+
+        validate_cmd = (self.register(_validate_int), "%P")
+
+        self.check_vars: dict[str, tk.BooleanVar] = {}
+        self.share_vars: dict[str, tk.StringVar] = {}
+        self._entries: dict[str, ttk.Entry] = {}
+
+        for row, owner_id in enumerate(owner_ids, start=1):
+            name = owner_names.get(owner_id, owner_id)
+            checked = owner_id in existing
+            check_var = tk.BooleanVar(value=checked)
+            share_var = tk.StringVar(value=str(existing.get(owner_id, 1)))
+            self.check_vars[owner_id] = check_var
+            self.share_vars[owner_id] = share_var
+
+            ttk.Checkbutton(
+                form,
+                text=f"{name} ({owner_id})",
+                variable=check_var,
+                command=lambda oid=owner_id: self._toggle_entry(oid),
+            ).grid(row=row, column=0, sticky="w", pady=3)
+            entry = ttk.Entry(form, textvariable=share_var, width=10, validate="key", validatecommand=validate_cmd)
+            entry.grid(row=row, column=1, sticky="w", pady=3)
+            if not checked:
+                entry.configure(state="disabled")
+            self._entries[owner_id] = entry
+
+        buttons = ttk.Frame(form)
+        buttons.grid(row=len(owner_ids) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="OK", command=self._submit).pack(side="right")
 
@@ -121,11 +228,34 @@ class ReceiptItemDialog(tk.Toplevel):
         self.wait_visibility()
         self.focus()
 
+    def _toggle_entry(self, owner_id: str) -> None:
+        """勾选归属人时启用份数输入框并默认填 1（方便平均分），取消勾选时禁用。"""
+        entry = self._entries[owner_id]
+        if self.check_vars[owner_id].get():
+            entry.configure(state="normal")
+            if not self.share_vars[owner_id].get().strip():
+                self.share_vars[owner_id].set("1")
+        else:
+            entry.configure(state="disabled")
+
     def _submit(self) -> None:
-        payload = {"id": self.item_id}
-        for key, variable in self.vars.items():
-            payload[key] = variable.get().strip()
-        self.result = ReceiptItemDialogResult(payload=payload)
+        splits: list[dict] = []
+        for owner_id in self.check_vars:
+            if not self.check_vars[owner_id].get():
+                continue
+            raw = self.share_vars[owner_id].get().strip()
+            if not raw.isdigit() or int(raw) <= 0:
+                messagebox.showerror(
+                    "Split Item",
+                    f"归属人「{self.owner_names.get(owner_id, owner_id)}」的份数必须是正整数。",
+                    parent=self,
+                )
+                return
+            splits.append({"owner_id": owner_id, "shares": int(raw)})
+        if not splits:
+            messagebox.showerror("Split Item", "请至少勾选一位归属人。", parent=self)
+            return
+        self.result = ItemSplitDialogResult(splits=splits)
         self.destroy()
 
 
@@ -793,6 +923,15 @@ class ExpenseTrackerGui(tk.Tk):
         self._image_zoom = min(12.0, max(0.25, self._image_zoom * factor))
         self._render_receipt_image()
 
+    def _format_item_owners(self, item: dict) -> str:
+        """Formal Items 的 Owner 列：若 item 有 split，显示所有参与 split 的归属人。"""
+        splits = item.get("splits") or []
+        if splits:
+            return " + ".join(
+                self.owner_names.get(s["owner_id"], s["owner_id"]) for s in splits
+            )
+        return self.owner_names.get(item["owner_id"], item["owner_id"])
+
     def _refresh_items_tree(self) -> None:
         for item in self.items_tree.get_children():
             self.items_tree.delete(item)
@@ -810,7 +949,7 @@ class ExpenseTrackerGui(tk.Tk):
                     item["quantity"],
                     item["unit_price"],
                     item["total_price"],
-                    self.owner_names.get(item["owner_id"], item["owner_id"]),
+                    self._format_item_owners(item),
                 ),
             )
         self._refresh_split_combo()
@@ -969,7 +1108,7 @@ class ExpenseTrackerGui(tk.Tk):
     def add_item(self) -> None:
         if self.current_receipt_payload is None:
             self.new_receipt()
-        dialog = ReceiptItemDialog(self, self.owner_ids)
+        dialog = ReceiptItemDialog(self, self.owner_ids, owner_names=self.owner_names)
         self.wait_window(dialog)
         if not dialog.result:
             return
@@ -983,7 +1122,7 @@ class ExpenseTrackerGui(tk.Tk):
         index = self._selected_item_index()
         if index is None or self.current_receipt_payload is None:
             return
-        dialog = ReceiptItemDialog(self, self.owner_ids, self.current_receipt_payload["items"][index])
+        dialog = ReceiptItemDialog(self, self.owner_ids, self.current_receipt_payload["items"][index], owner_names=self.owner_names)
         self.wait_window(dialog)
         if not dialog.result:
             return

@@ -10,6 +10,20 @@ from pydantic import BaseModel, Field
 from expense_tracker.schemas.enums import ItemCategory, OcrStatus, OwnerMode
 
 
+class ItemSplitRecord(BaseModel):
+    """单个 Item 分给某位 Owner 的份数（整数）。
+
+    设计要点（不改变统计口径）：
+    - 只记录"分摊意愿"（owner_id + 份数），不改动 quantity / unit_price / total_price；
+    - 单价 unit_price 保持原价不变（拆一盒零食不会让单价降低）；
+    - 真正的拆分逻辑后续按 份数比例 分配 total_price，各 Owner 承担之和恒等于原 total_price；
+    - 现有统计（按 owner_id 聚合 total_price）不受本字段影响。
+    """
+
+    owner_id: str = Field(min_length=1)
+    shares: int = Field(gt=0)
+
+
 class ReceiptItemRecord(BaseModel):
     id: str = Field(min_length=1)
     receipt_id: str = Field(min_length=1)
@@ -21,6 +35,7 @@ class ReceiptItemRecord(BaseModel):
     total_price: Decimal
     owner_id: str = Field(min_length=1)
     owner_marker: str | None = None
+    splits: list[ItemSplitRecord] = Field(default_factory=list)
 
 
 class RemovedItemRecord(BaseModel):

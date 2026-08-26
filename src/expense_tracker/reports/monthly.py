@@ -83,12 +83,37 @@ def _sum_items(items: Iterable[ReceiptItemRecord]) -> Decimal:
     return sum((item.total_price for item in items), start=Decimal("0"))
 
 
+def _item_owner_allocations(item: ReceiptItemRecord) -> list[tuple[str, Decimal]]:
+    """返回该 item 在 owner 维度上的金额分配。
+
+    - 无 splits：全部金额归 item.owner_id；
+    - 有 splits：按份数比例分摊 total_price，各份之和恒等于 total_price，
+      单价 unit_price 不受影响（只影响归属人维度的统计，不影响品类/总支出）。
+    """
+    if not item.splits:
+        return [(item.owner_id, item.total_price)]
+
+    total_shares = sum(split.shares for split in item.splits)
+    total_price = item.total_price
+    allocations: list[tuple[str, Decimal]] = []
+    allocated = Decimal("0")
+    for index, split in enumerate(item.splits):
+        if index == len(item.splits) - 1:
+            amount = total_price - allocated
+        else:
+            amount = (total_price * split.shares / total_shares).quantize(Decimal("0.01"))
+            allocated += amount
+        allocations.append((split.owner_id, amount))
+    return allocations
+
+
 def _sum_owner_totals(receipts: Iterable[ReceiptRecord]) -> dict[str, Decimal]:
-    """Sum item total_prices per owner_id from a list of receipts."""
+    """Sum item amounts per owner_id from a list of receipts (split-aware)."""
     totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
     for receipt in receipts:
         for item in receipt.items:
-            totals[item.owner_id] += item.total_price
+            for owner_id, amount in _item_owner_allocations(item):
+                totals[owner_id] += amount
     return dict(totals)
 
 
@@ -197,7 +222,8 @@ def _build_owner_spend(
     totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
     for receipt in receipts:
         for item in receipt.items:
-            totals[item.owner_id] += item.total_price
+            for owner_id, amount in _item_owner_allocations(item):
+                totals[owner_id] += amount
 
     grand_total = sum(totals.values(), start=Decimal("0"))
     rows = [

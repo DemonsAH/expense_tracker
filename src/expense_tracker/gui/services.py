@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from expense_tracker.reports import update_monthly_report
-from expense_tracker.schemas.domain import ReceiptItemRecord, ReceiptRecord, ReceiptStore, RemovedItemRecord
+from expense_tracker.schemas.domain import ItemSplitRecord, ReceiptItemRecord, ReceiptRecord, ReceiptStore, RemovedItemRecord
 from expense_tracker.schemas.enums import ItemCategory, OcrStatus, OwnerMode
 from expense_tracker.schemas.owners import OwnersConfig, load_owners_config
 from expense_tracker.storage import load_receipt_store, save_receipt_store
@@ -271,6 +271,30 @@ def _parse_date(value: str) -> date:
         raise ValueError("purchase_date must be YYYY-MM-DD.") from exc
 
 
+def _build_item_splits(raw_splits: Any, owner_ids: set[str]) -> list[ItemSplitRecord]:
+    """把 payload 中的 split 输入转成 ItemSplitRecord 列表（只记录分摊份数）。"""
+    if not raw_splits:
+        return []
+    built: list[ItemSplitRecord] = []
+    for entry in raw_splits:
+        owner_id = str(entry.get("owner_id") or "").strip()
+        if owner_id not in owner_ids:
+            raise ValueError(f"Unknown split owner_id: {owner_id}")
+        raw_shares = entry["shares"]
+        if isinstance(raw_shares, bool) or not isinstance(raw_shares, (int, float, str)):
+            raise ValueError("split shares must be a positive integer.")
+        try:
+            shares = int(raw_shares)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("split shares must be a positive integer.") from exc
+        if isinstance(raw_shares, float) and raw_shares != shares:
+            raise ValueError("split shares must be a positive integer.")
+        if shares <= 0:
+            raise ValueError("split shares must be a positive integer.")
+        built.append(ItemSplitRecord(owner_id=owner_id, shares=shares))
+    return built
+
+
 def _build_receipt_item_record(receipt_id: str, item_data: dict[str, Any], owner_ids: set[str], existing_id: str | None = None) -> ReceiptItemRecord:
     owner_id = str(item_data["owner_id"]).strip()
     if owner_id not in owner_ids:
@@ -287,6 +311,7 @@ def _build_receipt_item_record(receipt_id: str, item_data: dict[str, Any], owner
         total_price=_to_decimal(item_data["total_price"], "total_price"),
         owner_id=owner_id,
         owner_marker=(str(item_data["owner_marker"]).strip().upper() or None) if item_data.get("owner_marker") else None,
+        splits=_build_item_splits(item_data.get("splits"), owner_ids),
     )
 
 
@@ -471,6 +496,10 @@ def receipt_to_edit_payload(receipt: ReceiptRecord) -> dict[str, Any]:
                 "total_price": str(item.total_price),
                 "owner_id": item.owner_id,
                 "owner_marker": item.owner_marker or "",
+                "splits": [
+                    {"owner_id": split.owner_id, "shares": split.shares}
+                    for split in item.splits
+                ],
             }
             for item in receipt.items
         ],

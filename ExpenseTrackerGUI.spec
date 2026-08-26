@@ -9,11 +9,13 @@ a = Analysis(
     # 与基础环境的 8.6.12 库文件版本不匹配，导致 init.tcl 加载失败。
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['pyexpat', 'xml.parsers.expat'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        # 打包工具运行时（pkg_resources 会在启动时触发 pyexpat 加载，GUI 不需要）
+        'setuptools', 'pkg_resources', '_distutils_hack', 'distutils',
         # 深度学习 / OCR 实验库（与本项目无关）
         'torch', 'torchvision', 'easyocr', 'paddlex', 'visualdl', 'modelscope',
         'aistudio', 'aistudio_sdk', 'bce_python_sdk', 'huggingface_hub',
