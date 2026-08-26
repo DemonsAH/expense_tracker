@@ -21,7 +21,7 @@ receipt_input/
 
 # 数据与报表目录
 data/
-reports/
+/reports/
 
 # 备份与测试资源
 backup/
