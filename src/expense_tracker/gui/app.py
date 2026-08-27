@@ -953,17 +953,43 @@ class ExpenseTrackerGui(tk.Tk):
                 ),
             )
         self._refresh_split_combo()
+        self._refresh_owner_slots()
+
+    def _compute_owner_totals(self, items: list[dict]) -> dict[str, Decimal]:
+        """按 owner 聚合当前小票的金额（split-aware：有 splits 时按份数分摊，总和守恒）。"""
+        totals: dict[str, Decimal] = {}
+        for item in items:
+            splits = item.get("splits") or []
+            if not splits:
+                owner_id = str(item["owner_id"])
+                totals[owner_id] = totals.get(owner_id, Decimal("0")) + Decimal(str(item["total_price"]))
+                continue
+            total_shares = sum(int(split["shares"]) for split in splits)
+            total_price = Decimal(str(item["total_price"]))
+            allocated = Decimal("0")
+            for index, split in enumerate(splits):
+                if index == len(splits) - 1:
+                    amount = total_price - allocated
+                else:
+                    amount = (total_price * int(split["shares"]) / total_shares).quantize(Decimal("0.01"))
+                    allocated += amount
+                owner_id = str(split["owner_id"])
+                totals[owner_id] = totals.get(owner_id, Decimal("0")) + amount
+        return totals
 
     def _refresh_owner_slots(self) -> None:
-        """按当前 owners 配置重建"Assign Owner"槽（拖拽目标）。"""
+        """按当前 owners 配置重建"Assign Owner"槽（拖拽目标），并显示当前小票各归属人总价。"""
         for child in self.owner_slots_frame.winfo_children():
             child.destroy()
         self.owner_slots.clear()
+        items = (self.current_receipt_payload or {}).get("items", [])
+        totals = self._compute_owner_totals(items)
         for owner_id in self.owner_ids:
             name = self.owner_names.get(owner_id, owner_id)
+            total = totals.get(owner_id, Decimal("0"))
             slot = tk.Label(
                 self.owner_slots_frame,
-                text=f"{name}\n({owner_id})",
+                text=f"{name}\n({owner_id})\n€{total:.2f}",
                 justify="center",
                 anchor="center",
                 relief="groove",
