@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +19,11 @@ from expense_tracker.storage import (
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 DUPLICATE_POLICIES = {"skip-success", "retry-failed-only", "force-reprocess"}
+
+# 中文字符范围（基本区 / 扩展 A / 兼容区 / 全角 / CJK 符号）
+_CHINESE_RE = re.compile(
+    r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\uff00-\uffef\u3000-\u303f]"
+)
 
 
 @dataclass
@@ -42,6 +49,35 @@ def _iter_job_image_paths(directory: Path, *, recursive: bool) -> list[Path]:
         for path in iterator
         if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
     )
+
+
+def _unique_image_path(target: Path) -> Path:
+    """目标路径已存在时追加 _1/_2/... 避免覆盖。"""
+    if not target.exists():
+        return target
+    counter = 1
+    while True:
+        candidate = target.with_name(f"{target.stem}_{counter}{target.suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def _strip_chinese_from_filename(path: Path) -> Path | None:
+    """把文件名中的中文字符去除（就地重命名），返回新路径；无中文返回 None。
+
+    全角字符先归一化为半角（NFKC），再去掉中文；纯中文名（去除后为空）时
+    用文件哈希前 8 位兜底命名；重命名后与其他文件冲突时自动追加 _1/_2/...。
+    """
+    if not _CHINESE_RE.search(path.stem):
+        return None
+    normalized = unicodedata.normalize("NFKC", path.stem)
+    new_stem = _CHINESE_RE.sub("", normalized).strip(" _-")
+    if not new_stem:
+        new_stem = f"img_{compute_file_sha256(path)[:8]}"
+    target = _unique_image_path(path.with_name(f"{new_stem}{path.suffix}"))
+    path.rename(target)
+    return target
 
 
 def _should_skip_processed_image(store, image_path: Path) -> bool:
@@ -105,6 +141,15 @@ def run_ingest_directory_job(
     image_paths = _iter_job_image_paths(root, recursive=recursive)
     if not image_paths:
         raise ValueError(f"No supported receipt images found in: {root}")
+
+    # 开始处理（trigger）之前，先把文件名中的中文字符去除：
+    # 避免原生 OCR 程序（llama-mtmd-cli 等）对中文路径的兼容问题。
+    renamed_any = False
+    for image_path in image_paths:
+        if _strip_chinese_from_filename(image_path) is not None:
+            renamed_any = True
+    if renamed_any:
+        image_paths = _iter_job_image_paths(root, recursive=recursive)
 
     store = load_receipt_store(store_path)
     result = IngestJobResult(

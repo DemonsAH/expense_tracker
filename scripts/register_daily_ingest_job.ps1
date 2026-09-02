@@ -1,4 +1,4 @@
-# 注册"每日自动处理小票"的 Windows 计划任务。
+﻿# 注册"每日自动处理小票"的 Windows 计划任务。
 # 用法（PowerShell，项目根目录下）：
 #   .\scripts\register_daily_ingest_job.ps1
 #   .\scripts\register_daily_ingest_job.ps1 -At "23:30" -Preprocess -UseLlmParser

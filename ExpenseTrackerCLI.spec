@@ -12,6 +12,8 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        # 打包工具运行时（pkg_resources 会触发 pyexpat 加载，CLI 不需要）
+        'setuptools', 'pkg_resources', '_distutils_hack', 'distutils',
         # 深度学习 / OCR 实验库（与本项目无关）
         'torch', 'torchvision', 'easyocr', 'paddlex', 'visualdl', 'modelscope',
         'aistudio', 'aistudio_sdk', 'bce_python_sdk', 'huggingface_hub',
