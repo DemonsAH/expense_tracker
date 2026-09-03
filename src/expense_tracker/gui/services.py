@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
 import webbrowser
 from dataclasses import dataclass
@@ -613,6 +615,54 @@ def trigger_ingestion(
         return receipt_id, result.content, result.preprocess_info
     except ReceiptAttemptError as exc:
         raise ReceiptAttemptError(str(exc), content=exc.content) from exc
+
+
+# 手机照片上传服务（upload_server.py / ExpenseTrackerUpload.exe）默认端口
+UPLOAD_SERVER_PORT = 8765
+UPLOAD_SERVER_HOST = "127.0.0.1"
+
+
+def is_upload_server_running(
+    host: str = UPLOAD_SERVER_HOST,
+    port: int = UPLOAD_SERVER_PORT,
+    timeout: float = 0.5,
+) -> bool:
+    """探测上传服务是否已在监听 host:port。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _upload_server_command(project_root: Path) -> list[str] | None:
+    """返回启动上传服务的命令行；打包 exe 优先，源码模式退回 python 脚本。"""
+    exe = project_root / "dist" / "ExpenseTrackerUpload.exe"
+    if exe.exists():
+        return [str(exe)]
+    source = project_root / "upload_server.py"
+    if source.exists():
+        return [sys.executable, str(source)]
+    return None
+
+
+def check_and_start_upload_server(project_root: str | Path) -> str:
+    """GUI 启动时调用：若上传服务未运行则自动启动，返回给状态栏的消息。"""
+    root = Path(project_root)
+    if is_upload_server_running():
+        return "上传服务已开启"
+    command = _upload_server_command(root)
+    if command is None:
+        return "上传服务未运行，且找不到启动程序"
+    try:
+        kwargs: dict[str, Any] = {"cwd": str(root)}
+        if os.name == "nt":
+            # 静默启动：不让打包成 console 的 exe 再弹出一个黑窗口
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(command, **kwargs)
+    except OSError as exc:
+        return f"上传服务启动失败：{exc}"
+    return "上传服务未运行，已自动启动"
 
 
 def reopen_failed_receipt(paths: AppPaths, failed_index: int) -> str:

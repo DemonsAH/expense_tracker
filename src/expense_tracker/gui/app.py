@@ -14,6 +14,7 @@ from PIL import Image, ImageTk
 from expense_tracker.gui.services import (
     AppPaths,
     build_new_receipt_draft,
+    check_and_start_upload_server,
     default_app_paths,
     delete_receipt,
     ensure_receipt_flow_dirs,
@@ -289,6 +290,12 @@ class ExpenseTrackerGui(tk.Tk):
         self._build_style()
         self._build_shell()
         self.refresh_all()
+        # UI 就绪后再探测上传服务（不阻塞首屏），未运行则自动启动
+        self.after(500, self._auto_check_upload_server)
+
+    def _auto_check_upload_server(self) -> None:
+        message = check_and_start_upload_server(self.paths.project_root)
+        self.status_var.set(message)
 
     def _build_style(self) -> None:
         style = ttk.Style(self)
