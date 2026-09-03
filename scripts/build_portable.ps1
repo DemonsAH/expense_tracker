@@ -67,6 +67,7 @@ if ($CopyOcrService) {
 New-Item -ItemType Directory -Force -Path (Join-Path $out "scripts") | Out-Null
 Copy-Item (Join-Path $ProjectRoot "scripts\register_daily_ingest_job.ps1") (Join-Path $out "scripts\register_daily_ingest_job.ps1")
 Copy-Item (Join-Path $ProjectRoot "scripts\register_upload_server_job.ps1") (Join-Path $out "scripts\register_upload_server_job.ps1")
+Copy-Item (Join-Path $ProjectRoot "scripts\download_ocr_service.ps1") (Join-Path $out "scripts\download_ocr_service.ps1")
 $bat = "@echo off`r`nrem manually start the upload server (portable layout)`r`ncd /d `"%~dp0..`"`r`nstart `"ExpenseTrackerUpload`" ExpenseTrackerUpload.exe`r`necho Upload server started. Phone browser: http://LAN_IP:8765/`r`npause"
 Set-Content -Path (Join-Path $out "scripts\start_upload.bat") -Value $bat -Encoding ascii
 
@@ -110,13 +111,14 @@ Expense Tracker - 便携目录（无需安装 Python）
    任务命令会自动选择根目录的 ExpenseTrackerCLI.exe。
    注意：任务使用你的 Windows 账户与固定路径，换机/移动目录后需重新注册。
 
-7) 完整本地识别（可选，模型单独下载）
-   若需要本地 GLM-OCR 识别（不依赖 DeepSeek 也能跑规则解析），把
-   ocr_service 目录（含 llama 模型，约 2.5GB）放入本目录根：
-     ocr_service\llama\llama-mtmd-cli.exe
-     ocr_service\llama\models\GLM-OCR-Q8_0.gguf
-     ocr_service\llama\models\mmproj-GLM-OCR-Q8_0.gguf
-   模型下载地址与放置指引见仓库 README（ocr_service/llama/models 章节）。
+7) 完整本地识别（可选，模型/运行时分开下载）
+   在本目录 PowerShell 中执行以下脚本即可自动补齐：
+     .\scripts\download_ocr_service.ps1            # 只下模型(~1.4GB)
+     .\scripts\download_ocr_service.ps1 -Runtime   # 模型 + CUDA12.4 运行时(需 N 卡)
+     .\scripts\download_ocr_service.ps1 -RuntimeCpu  # 模型 + CPU 运行时(无 N 卡)
+   也可手工放置：模型放 ocr_service\llama\models\（两个 gguf），运行时
+   （llama-mtmd-cli.exe / mtmd.dll / ggml*.dll / cuda dll）放 ocr_service\llama\。
+   模型下载地址与放置指引见仓库 README（GLM-OCR 模型文件下载 章节）。
 
 8) 配置 DeepSeek（可选但推荐）
    复制 .env.example 为 .env 并填入 DEEPSEEK_API_KEY，GUI 勾选的
