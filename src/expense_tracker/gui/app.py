@@ -286,6 +286,8 @@ class ExpenseTrackerGui(tk.Tk):
         self._receipt_photo = None  # keep reference to avoid GC dropping the image
         self._image_original = None  # PIL image of the current receipt
         self._image_zoom = DEFAULT_IMAGE_ZOOM  # initial zoom factor
+        # 预览旋转角度（0/90/180/270，仅影响预览显示，不改动磁盘原图）
+        self._image_rotation = 0
 
         self._build_style()
         self._build_shell()
@@ -444,7 +446,11 @@ class ExpenseTrackerGui(tk.Tk):
         self.receipt_tree.bind("<<TreeviewSelect>>", self._on_receipt_selected)
 
         # Dedicated image column on the right (scrollable both ways, wheel zoom).
-        ttk.Label(image_pane, text="Receipt Image").grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 6), pady=(0, 6))
+        image_header = ttk.Frame(image_pane)
+        image_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Label(image_header, text="Receipt Image").pack(side="left")
+        ttk.Button(image_header, text="⟲ Rotate", width=8, command=lambda: self._rotate_receipt_image(-90)).pack(side="right", padx=(4, 0))
+        ttk.Button(image_header, text="⟳ Rotate", width=8, command=lambda: self._rotate_receipt_image(90)).pack(side="right")
         self.image_canvas = tk.Canvas(image_pane, highlightthickness=0, width=300)
         image_vscroll = ttk.Scrollbar(image_pane, orient="vertical", command=self.image_canvas.yview)
         image_hscroll = ttk.Scrollbar(image_pane, orient="horizontal", command=self.image_canvas.xview)
@@ -876,6 +882,7 @@ class ExpenseTrackerGui(tk.Tk):
         unreadable file simply shows a placeholder text. The image starts at
         the default zoom and the mouse wheel adjusts the zoom factor.
         """
+        self._image_rotation = 0
         if not image_path:
             self._image_original = None
             self._image_zoom = DEFAULT_IMAGE_ZOOM
@@ -899,13 +906,24 @@ class ExpenseTrackerGui(tk.Tk):
         self._image_zoom = DEFAULT_IMAGE_ZOOM
         self._render_receipt_image()
 
+    def _rotate_receipt_image(self, degrees: int) -> None:
+        """按 90° 步进旋转预览图（仅显示层，不改动磁盘原图）。"""
+        if self._image_original is None:
+            return
+        self._image_rotation = (self._image_rotation + degrees) % 360
+        self._render_receipt_image()
+
     def _render_receipt_image(self) -> None:
         """Render the current receipt image at the current zoom factor."""
         if self._image_original is None:
             return
 
-        width = max(1, int(self._image_original.width * self._image_zoom))
-        height = max(1, int(self._image_original.height * self._image_zoom))
+        img = self._image_original
+        if self._image_rotation:
+            img = img.rotate(self._image_rotation, expand=True, resample=Image.BICUBIC)
+
+        width = max(1, int(img.width * self._image_zoom))
+        height = max(1, int(img.height * self._image_zoom))
         # Cap the rendered size to keep memory reasonable while still allowing
         # close inspection of small receipt text.
         max_side = 2400
@@ -914,7 +932,7 @@ class ExpenseTrackerGui(tk.Tk):
             width = max(1, int(width * scale))
             height = max(1, int(height * scale))
 
-        img = self._image_original.resize((width, height), Image.LANCZOS)
+        img = img.resize((width, height), Image.LANCZOS)
         self._receipt_photo = ImageTk.PhotoImage(img)
         self.receipt_image_label.configure(
             image=self._receipt_photo,
