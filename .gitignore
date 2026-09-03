@@ -40,3 +40,6 @@ ocr_service/llama/*.log
 check4.txt
 check5.txt
 rejected_receipts/
+
+# 便携目录组装产物（scripts/build_portable.ps1 输出）
+/out/

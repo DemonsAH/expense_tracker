@@ -1,4 +1,4 @@
-# Register daily scheduled tasks to auto start/stop the upload server.
+﻿# Register daily scheduled tasks to auto start/stop the upload server.
 #   - ExpenseTrackerUploadStart : every day 21:00, start the upload server
 #   - ExpenseTrackerUploadStop  : every day 23:00, stop the upload server
 # Usage (PowerShell, project root):
@@ -14,9 +14,13 @@ param(
     [string]$StopAt = "23:00"
 )
 
-$exe = Join-Path $ProjectRoot "dist\ExpenseTrackerUpload.exe"
-if (-not (Test-Path $exe)) {
-    throw "Upload exe not found: $exe (build with ExpenseTrackerUpload.spec first)"
+# 兼容仓库形态（dist\ExpenseTrackerUpload.exe）与便携形态（exe 在根目录）
+$exe = @(
+    (Join-Path $ProjectRoot "dist\ExpenseTrackerUpload.exe"),
+    (Join-Path $ProjectRoot "ExpenseTrackerUpload.exe")
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $exe) {
+    throw "Upload exe not found under $ProjectRoot (build with ExpenseTrackerUpload.spec first)"
 }
 
 $startCmd = "Start-Process -FilePath '$exe' -WorkingDirectory '$ProjectRoot' -WindowStyle Hidden"

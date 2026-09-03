@@ -17,12 +17,14 @@ from expense_tracker.gui.services import (
     check_and_start_upload_server,
     default_app_paths,
     delete_receipt,
+    ensure_owners_config,
     ensure_receipt_flow_dirs,
     exe_build_time,
     generate_report,
     is_splittable_item,
     list_reports,
     load_app_state,
+    normalize_store_image_paths,
     open_html_report,
     open_path,
     receipt_to_edit_payload,
@@ -1358,6 +1360,11 @@ class ExpenseTrackerGui(tk.Tk):
 def run_app(paths: AppPaths | None = None) -> None:
     paths = paths or default_app_paths()
     ensure_receipt_flow_dirs(paths.project_root)
+    # 全新环境/便携目录：无 owners.json 时首启生成默认单归属人模板
+    ensure_owners_config(paths.owners_path)
+    # 换机/移动目录后：把库里指向 receipt_input/ 的绝对路径改写为相对路径，
+    # 避免旧机器的 C:\... 盘符在新电脑上失效（图片显示/移动依赖该路径）。
+    normalize_store_image_paths(paths)
     app = ExpenseTrackerGui(paths=paths)
     app.mainloop()
 

@@ -1,4 +1,4 @@
-﻿# 注册"每日自动处理小票"的 Windows 计划任务。
+﻿﻿# 注册"每日自动处理小票"的 Windows 计划任务。
 # 用法（PowerShell，项目根目录下）：
 #   .\scripts\register_daily_ingest_job.ps1
 #   .\scripts\register_daily_ingest_job.ps1 -At "23:30" -Preprocess
@@ -16,9 +16,13 @@ param(
     [string]$TaskName = "ExpenseTrackerDailyIngest"
 )
 
-$exe = Join-Path $ProjectRoot "dist\ExpenseTrackerCLI.exe"
-if (-not (Test-Path $exe)) {
-    throw "CLI exe not found: $exe (先执行 ExpenseTrackerCLI.spec 打包)"
+# 兼容仓库形态（dist\ExpenseTrackerCLI.exe）与便携形态（exe 在根目录）
+$exe = @(
+    (Join-Path $ProjectRoot "dist\ExpenseTrackerCLI.exe"),
+    (Join-Path $ProjectRoot "ExpenseTrackerCLI.exe")
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $exe) {
+    throw "CLI exe not found under $ProjectRoot (先执行 ExpenseTrackerCLI.spec 打包)"
 }
 
 # 用 cmd /c 先切换工作目录，保证 CLI 里默认的相对路径

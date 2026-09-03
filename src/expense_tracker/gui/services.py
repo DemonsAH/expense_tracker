@@ -122,7 +122,26 @@ def exe_build_time() -> str:
     return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
 
 
+def _portable_root_if_frozen() -> Path | None:
+    """便携布局下返回项目根：frozen 时 exe 与其 owners.json 同目录。
+
+    便携目录把三个 exe 直接放在根目录（区别于仓库形态：exe 在 dist/ 子目录、
+    根目录在更上层）。此时无需 src/ 也能定位，方便整目录拷到别的机器即用。
+    仓库形态（exe 在 dist/ 下）返回 None，走原有向上搜索逻辑。
+    """
+    if not _is_frozen():
+        return None
+    exe_dir = Path(sys.executable).resolve().parent
+    if (exe_dir / "owners.json").is_file():
+        return exe_dir
+    return None
+
+
 def find_project_root(start: Path | None = None) -> Path:
+    portable_root = _portable_root_if_frozen()
+    if portable_root is not None:
+        return portable_root
+
     candidates: list[Path] = []
     if start is not None:
         candidates.append(start.resolve())
@@ -154,6 +173,55 @@ def default_app_paths() -> AppPaths:
         reports_dir=root / "reports",
         rejected_dir=root / "rejected_receipts",
     )
+
+
+def ensure_owners_config(owners_path: str | Path) -> bool:
+    """owners.json 不存在时生成默认单归属人模板，返回是否新建。
+
+    便携目录/全新环境没有现成归属人配置，首启先生成一份可用模板
+    （GUI 无归属人编辑界面，用户之后手工编辑该 JSON 增删成员即可）。
+    已存在时不覆盖，原样返回 False。
+    """
+    path = Path(owners_path)
+    if path.is_file():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "owners": [
+                    {"id": "me", "name": "Me", "marker": "M", "is_me": True}
+                ]
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return True
+
+
+def normalize_store_image_paths(paths: AppPaths) -> int:
+    """把 store 中指向 receipt_input/ 的绝对 image_path 改写为相对项目根的路径。
+
+    绝对路径（如 GUI verify 保存产生的 C:\\...\\receipt_input\\已校对\\x.jpg）在
+    换机/移动目录后会失效；相对路径则无论在仓库形态还是便携目录形态下都有效
+    （读取时统一基于 project_root 解析）。仅当文件确实存在于项目根下才改写，
+    避免误改丢失引用。返回改写条数。
+    """
+    store = load_receipt_store(paths.store_path)
+    changed = 0
+    for receipt in store.receipts:
+        raw = receipt.image_path or ""
+        if not raw or not Path(raw).is_absolute() or "receipt_input" not in raw:
+            continue
+        relative = Path(raw[raw.find("receipt_input"):])
+        if (paths.project_root / relative).exists():
+            receipt.image_path = str(relative)
+            changed += 1
+    if changed:
+        save_receipt_store(store, paths.store_path)
+    return changed
 
 
 def load_app_state(paths: AppPaths) -> tuple[ReceiptStore, OwnersConfig]:
@@ -642,13 +710,21 @@ def is_upload_server_running(
 
 
 def _upload_server_command(project_root: Path) -> list[str] | None:
-    """返回启动上传服务的命令行；打包 exe 优先，源码模式退回 python 脚本。"""
-    exe = project_root / "dist" / "ExpenseTrackerUpload.exe"
-    if exe.exists():
-        return [str(exe)]
-    source = project_root / "upload_server.py"
-    if source.exists():
-        return [sys.executable, str(source)]
+    """返回启动上传服务的命令行；打包 exe 优先，源码模式退回 python 脚本。
+
+    兼容仓库形态（dist/ExpenseTrackerUpload.exe）与便携形态
+    （ExpenseTrackerUpload.exe 直接放根目录）。
+    """
+    candidates = [
+        project_root / "dist" / "ExpenseTrackerUpload.exe",
+        project_root / "ExpenseTrackerUpload.exe",
+        project_root / "upload_server.py",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            if candidate.suffix.lower() == ".exe":
+                return [str(candidate)]
+            return [sys.executable, str(candidate)]
     return None
 
 
