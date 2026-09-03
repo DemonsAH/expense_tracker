@@ -70,14 +70,20 @@ def move_verified_receipt_image(
     """把已校对小票的图片从 已处理/ 移到 已校对/，并按 receipt id 重命名。
 
     仅当图片位于 receipt_input/已处理/ 下时才移动；否则原样返回（不越权移动
-    其它目录的图片）。返回新路径，无需移动时返回 None。
+    其它目录的图片）。image_path 既可能是绝对路径也可能是相对项目根的相对路径
+    （定时批处理入库时存的是相对路径，GUI 手动 trigger 存绝对路径），移动前
+    统一解析为绝对路径后再比较，避免 relative_to 因基准不一致而误判为不移动。
+    返回新路径，无需移动时返回 None。
     """
     if not image_path:
         return None
+    root = Path(project_root).resolve()
     source = Path(image_path)
-    _, processed_dir, reviewed_dir = receipt_flow_dirs(project_root)
+    if not source.is_absolute():
+        source = root / source
+    _, processed_dir, reviewed_dir = receipt_flow_dirs(root)
     try:
-        source.relative_to(processed_dir)
+        source.resolve().relative_to(processed_dir.resolve())
     except ValueError:
         return None
 

@@ -1119,8 +1119,14 @@ class ExpenseTrackerGui(tk.Tk):
         return payload
 
     def save_current_receipt(self) -> None:
+        payload = self._gather_receipt_payload_from_form()
+        image_path = str(payload.get("image_path") or "")
+        # 勾选 verified 保存时会尝试把图片从 已处理/ 移到 已校对/。PIL 的
+        # Image.open 会一直持有文件句柄，若不先关闭，Windows 移动同一文件会
+        # 抛 WinError 32（文件被占用）。手动记录（无图）无需处理。
+        if payload.get("is_verified") and image_path and not image_path.startswith("manual://"):
+            self._close_receipt_image()
         try:
-            payload = self._gather_receipt_payload_from_form()
             record = save_receipt_edit(
                 self.paths,
                 payload,
@@ -1129,10 +1135,28 @@ class ExpenseTrackerGui(tk.Tk):
             )
         except Exception as exc:
             messagebox.showerror("Save Receipt", str(exc), parent=self)
+            # 保存失败时图片通常仍在原处：恢复预览（句柄已被上面释放）
+            self._load_receipt_image(image_path)
             return
         self.status_var.set(f"Saved {record.id}")
+        # refresh_receipts 会用 store 中更新后的 image_path（若图片已移入
+        # 已校对则为新位置）重载预览。
         self.refresh_receipts()
         self._reveal_receipt(record.id)
+
+    def _close_receipt_image(self) -> None:
+        """关闭 PIL 对当前预览图的文件句柄。
+
+        勾选 verified 保存前必须先释放句柄，否则移动/重命名这张图时
+        Windows 会因文件被本进程占用而抛 WinError 32。
+        """
+        if self._image_original is not None:
+            try:
+                self._image_original.close()
+            except Exception:
+                pass
+            self._image_original = None
+            self._image_rotation = 0
 
     def delete_current_receipt(self) -> None:
         payload = self.current_receipt_payload
